@@ -6,8 +6,15 @@ import core from '../dist/core.js';
 
 const {
   parseCatalogHtml, parseChapterHtml, parseEpub, parsePlainText, paginate, renderBoss,
-  likelyCatalogUrl, parseMediaWikiSearch, parseZonghengSearch
+  likelyCatalogUrl, pageNavigationState, parseMediaWikiSearch, parseZonghengSearch
 } = core;
+
+test('switches editor navigation between pages and chapters at page boundaries', () => {
+  assert.deepEqual(pageNavigationState(0, 3), { hasPreviousPage: false, hasNextPage: true });
+  assert.deepEqual(pageNavigationState(1, 3), { hasPreviousPage: true, hasNextPage: true });
+  assert.deepEqual(pageNavigationState(2, 3), { hasPreviousPage: true, hasNextPage: false });
+  assert.deepEqual(pageNavigationState(0, 1), { hasPreviousPage: false, hasNextPage: false });
+});
 
 test('parses a Mayi-style catalog', () => {
   const html = `

@@ -9,4 +9,4 @@ export {
 } from './adapters';
 export { parseEpub, parsePlainText } from './local';
 export { fetchHtml } from './net';
-export { paginate, renderBoss, renderReader } from './renderer';
+export { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';

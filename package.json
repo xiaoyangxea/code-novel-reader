@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在原生 TypeScript 编辑器中以代码注释阅读在线或本地小说。",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "local-hu",
   "license": "MIT",
   "engines": {
@@ -54,19 +54,23 @@
       },
       {
         "command": "codeNovel.nextPage",
-        "title": "代码小说: 下一页"
+        "title": "代码小说: 下一页",
+        "icon": "$(arrow-right)"
       },
       {
         "command": "codeNovel.previousPage",
-        "title": "代码小说: 上一页"
+        "title": "代码小说: 上一页",
+        "icon": "$(arrow-left)"
       },
       {
         "command": "codeNovel.nextChapter",
-        "title": "代码小说: 下一章"
+        "title": "代码小说: 下一章",
+        "icon": "$(arrow-right)"
       },
       {
         "command": "codeNovel.previousChapter",
-        "title": "代码小说: 上一章"
+        "title": "代码小说: 上一章",
+        "icon": "$(arrow-left)"
       },
       {
         "command": "codeNovel.chooseChapter",
@@ -74,7 +78,8 @@
       },
       {
         "command": "codeNovel.toggleBoss",
-        "title": "代码小说: 老板键"
+        "title": "代码小说: 老板键",
+        "icon": "$(eye-closed)"
       },
       {
         "command": "codeNovel.reloadChapter",
@@ -166,13 +171,23 @@
       ],
       "editor/title": [
         {
-          "command": "codeNovel.previousChapter",
-          "when": "resourceScheme == code-novel",
+          "command": "codeNovel.previousPage",
+          "when": "resourceScheme == code-novel && !codeNovel.bossMode && codeNovel.hasPreviousPage",
           "group": "navigation@1"
         },
         {
+          "command": "codeNovel.previousChapter",
+          "when": "resourceScheme == code-novel && !codeNovel.bossMode && !codeNovel.hasPreviousPage",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeNovel.nextPage",
+          "when": "resourceScheme == code-novel && !codeNovel.bossMode && codeNovel.hasNextPage",
+          "group": "navigation@2"
+        },
+        {
           "command": "codeNovel.nextChapter",
-          "when": "resourceScheme == code-novel",
+          "when": "resourceScheme == code-novel && !codeNovel.bossMode && !codeNovel.hasNextPage",
           "group": "navigation@2"
         },
         {

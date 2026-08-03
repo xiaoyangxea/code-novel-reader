@@ -1,5 +1,15 @@
 import { Book, ChapterContent } from './model';
 
+export function pageNavigationState(pageIndex: number, pageCount: number): {
+  hasPreviousPage: boolean;
+  hasNextPage: boolean;
+} {
+  return {
+    hasPreviousPage: pageIndex > 0,
+    hasNextPage: pageIndex < Math.max(pageCount - 1, 0)
+  };
+}
+
 export function paginate(content: string, targetCharacters: number): string[] {
   const paragraphs = content.replace(/\r/g, '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
   const pages: string[] = [];

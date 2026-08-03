@@ -4,7 +4,7 @@ import { loadChapter } from './adapters';
 import { parseEpub, ParsedLocalBook, parsePlainText } from './local';
 import { Book, ChapterContent, ReadingProgress } from './model';
 import { BookRepository } from './repository';
-import { paginate, renderBoss, renderReader } from './renderer';
+import { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
 
 export class ReaderDocumentProvider implements vscode.TextDocumentContentProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
@@ -138,6 +138,7 @@ export class ReaderController {
   }
 
   private render(): void {
+    this.updateNavigationContext();
     if (!this.activeBook || !this.chapter) {
       this.provider.update(renderBoss());
       return;
@@ -156,6 +157,15 @@ export class ReaderController {
       this.config().commentWidth
     ));
     this.revealReadingArea();
+  }
+
+  private updateNavigationContext(): void {
+    const state = this.activeBook && this.chapter && !this.bossMode
+      ? pageNavigationState(this.progress.pageIndex, this.pages.length)
+      : { hasPreviousPage: false, hasNextPage: false };
+    void vscode.commands.executeCommand('setContext', 'codeNovel.hasPreviousPage', state.hasPreviousPage);
+    void vscode.commands.executeCommand('setContext', 'codeNovel.hasNextPage', state.hasNextPage);
+    void vscode.commands.executeCommand('setContext', 'codeNovel.bossMode', this.bossMode);
   }
 
   private revealReadingArea(): void {
