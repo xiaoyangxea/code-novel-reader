@@ -1,0 +1,262 @@
+{
+  "name": "code-novel-reader",
+  "displayName": "Code Novel Reader - 代码小说阅读器",
+  "description": "在原生 TypeScript 编辑器中以代码注释阅读在线或本地小说。",
+  "version": "0.3.0",
+  "publisher": "local-hu",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "novel",
+    "reader",
+    "typescript",
+    "小说",
+    "阅读"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:codeNovel.library"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeNovel.searchOnline",
+        "title": "代码小说: 搜索在线小说",
+        "icon": "$(search)"
+      },
+      {
+        "command": "codeNovel.importUrl",
+        "title": "代码小说: 导入 URL",
+        "icon": "$(link)"
+      },
+      {
+        "command": "codeNovel.openLocal",
+        "title": "代码小说: 打开本地 TXT/EPUB",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "codeNovel.openBook",
+        "title": "代码小说: 打开书籍"
+      },
+      {
+        "command": "codeNovel.removeBook",
+        "title": "代码小说: 从书架移除"
+      },
+      {
+        "command": "codeNovel.refreshLibrary",
+        "title": "代码小说: 刷新书架",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codeNovel.nextPage",
+        "title": "代码小说: 下一页"
+      },
+      {
+        "command": "codeNovel.previousPage",
+        "title": "代码小说: 上一页"
+      },
+      {
+        "command": "codeNovel.nextChapter",
+        "title": "代码小说: 下一章"
+      },
+      {
+        "command": "codeNovel.previousChapter",
+        "title": "代码小说: 上一章"
+      },
+      {
+        "command": "codeNovel.chooseChapter",
+        "title": "代码小说: 选择章节"
+      },
+      {
+        "command": "codeNovel.toggleBoss",
+        "title": "代码小说: 老板键"
+      },
+      {
+        "command": "codeNovel.reloadChapter",
+        "title": "代码小说: 重新抓取当前章节"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codeNovel.nextPage",
+        "key": "alt+right",
+        "when": "codeNovel.readerActive"
+      },
+      {
+        "command": "codeNovel.previousPage",
+        "key": "alt+left",
+        "when": "codeNovel.readerActive"
+      },
+      {
+        "command": "codeNovel.nextChapter",
+        "key": "alt+shift+right",
+        "when": "codeNovel.readerActive"
+      },
+      {
+        "command": "codeNovel.previousChapter",
+        "key": "alt+shift+left",
+        "when": "codeNovel.readerActive"
+      },
+      {
+        "command": "codeNovel.toggleBoss",
+        "key": "ctrl+alt+b"
+      },
+      {
+        "command": "codeNovel.chooseChapter",
+        "key": "ctrl+alt+l",
+        "when": "codeNovel.readerActive"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codeNovel",
+          "title": "代码小说",
+          "icon": "media/book.svg"
+        }
+      ]
+    },
+    "views": {
+      "codeNovel": [
+        {
+          "id": "codeNovel.library",
+          "name": "书架"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "codeNovel.searchOnline",
+          "when": "view == codeNovel.library",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeNovel.importUrl",
+          "when": "view == codeNovel.library",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codeNovel.openLocal",
+          "when": "view == codeNovel.library",
+          "group": "navigation@3"
+        },
+        {
+          "command": "codeNovel.refreshLibrary",
+          "when": "view == codeNovel.library",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codeNovel.openBook",
+          "when": "view == codeNovel.library && viewItem == codeNovel.book",
+          "group": "inline@1"
+        },
+        {
+          "command": "codeNovel.removeBook",
+          "when": "view == codeNovel.library && viewItem == codeNovel.book",
+          "group": "inline@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "codeNovel.previousChapter",
+          "when": "resourceScheme == code-novel",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeNovel.nextChapter",
+          "when": "resourceScheme == code-novel",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codeNovel.toggleBoss",
+          "when": "resourceScheme == code-novel",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Code Novel Reader",
+      "properties": {
+        "codeNovel.pageCharacters": {
+          "type": "number",
+          "default": 1400,
+          "minimum": 200,
+          "maximum": 10000,
+          "description": "每页大约显示的字符数。"
+        },
+        "codeNovel.commentWidth": {
+          "type": "number",
+          "default": 72,
+          "minimum": 30,
+          "maximum": 160,
+          "description": "TypeScript 注释每行的最大字符数。"
+        },
+        "codeNovel.requestTimeout": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 3000,
+          "maximum": 60000,
+          "description": "网页请求超时（毫秒）。"
+        },
+        "codeNovel.userAgent": {
+          "type": "string",
+          "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+          "description": "抓取公开网页时使用的 User-Agent。"
+        },
+        "codeNovel.proxy": {
+          "type": "string",
+          "default": "",
+          "description": "可选 HTTP/HTTPS 代理，例如 http://127.0.0.1:7890。留空时读取 VS Code http.proxy 和环境变量。"
+        },
+        "codeNovel.searchProviders": {
+          "type": "array",
+          "default": [],
+          "description": "额外搜索源。URL 中用 {keyword} 表示搜索词；结果使用通用 HTML 识别。",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "url"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "check": "tsc --noEmit",
+    "test": "npm run compile && node --test tests/*.test.mjs",
+    "package": "npm run check && npm test && vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "iconv-lite": "^0.6.3",
+    "jszip": "^3.10.1",
+    "undici": "^6.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.2"
+  }
+}
