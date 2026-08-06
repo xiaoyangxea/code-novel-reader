@@ -1,9 +1,15 @@
 # Change Log
 
+## Unreleased
+
+- 增加 GitHub Actions 标签发布流程，自动测试、打包并发布到 VS Code Marketplace。
+- 更新安装、自动更新、本地开发、隐私和问题反馈文档。
+
 ## 0.3.2
 
 - 使用正式 Marketplace 发布者 `xiaoyangxea`。
 - 补充商店主页、问题反馈、图标和展示信息。
+- 首次发布到 VS Code Marketplace。
 
 ## 0.3.1
 
