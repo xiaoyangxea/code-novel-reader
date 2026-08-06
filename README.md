@@ -19,7 +19,7 @@
 
 ## 安装
 
-在 VS Code 中执行 `Extensions: Install from VSIX...`，选择生成的 `code-novel-reader-0.3.1.vsix`。
+在 VS Code 中执行 `Extensions: Install from VSIX...`，选择生成的 `code-novel-reader-0.3.2.vsix`。
 
 ## 使用
 

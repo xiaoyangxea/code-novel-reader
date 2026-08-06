@@ -2,9 +2,23 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在原生 TypeScript 编辑器中以代码注释阅读在线或本地小说。",
-  "version": "0.3.1",
-  "publisher": "local-hu",
+  "version": "0.3.2",
+  "publisher": "xiaoyangxea",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "pricing": "Free",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaoyangxea/code-novel-reader.git"
+  },
+  "homepage": "https://github.com/xiaoyangxea/code-novel-reader#readme",
+  "bugs": {
+    "url": "https://github.com/xiaoyangxea/code-novel-reader/issues"
+  },
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
