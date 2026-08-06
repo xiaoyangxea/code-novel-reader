@@ -9,6 +9,9 @@ const {
   likelyCatalogUrl, pageNavigationState, parseMediaWikiSearch, parseZonghengSearch
 } = core;
 
+const { normalizeNovelSource, parseSourceSearchHtml } = core;
+const { assertSafeRemoteUrl, isBlockedNetworkAddress, readBodyLimited } = core;
+
 test('switches editor navigation between pages and chapters at page boundaries', () => {
   assert.deepEqual(pageNavigationState(0, 3), { hasPreviousPage: false, hasNextPage: true });
   assert.deepEqual(pageNavigationState(1, 3), { hasPreviousPage: true, hasNextPage: true });
@@ -112,6 +115,14 @@ test('parses a minimal EPUB spine', async () => {
   assert.match(parsed.contents[1].content, /第二章的正文内容/);
 });
 
+test('rejects EPUB entries with a compression-bomb ratio before extraction', async () => {
+  const zip = new JSZip();
+  zip.file('META-INF/container.xml', '<container/>');
+  zip.file('OEBPS/bomb.xhtml', 'A'.repeat(1_000_000));
+  const bytes = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 9 } });
+  await assert.rejects(parseEpub(bytes, 'bomb.epub'), /压缩比异常/);
+});
+
 test('boss view contains no reading text', () => {
   const hidden = renderBoss();
   assert.match(hidden, /ValidationPipeline/);
@@ -189,4 +200,104 @@ test('parses Zongheng and Wikisource search APIs', () => {
   assert.equal(wiki[0].title, '红楼梦/第一回');
   assert.match(wiki[0].url, /wikisource\.org\/wiki\//);
   assert.equal(wiki[0].latestChapter, '章节简介');
+});
+
+test('imports a data-only source rule and parses its search results', () => {
+  const source = normalizeNovelSource({
+    version: 1,
+    name: '测试书源',
+    domains: ['books.example.com'],
+    search: {
+      url: 'https://books.example.com/search?q={keyword}',
+      resultSelector: '.result',
+      titleSelector: '.title',
+      urlSelector: '.title',
+      authorSelector: '.author'
+    },
+    catalog: { titleSelector: 'h1', chapterSelector: '#list a' },
+    chapter: { titleSelector: 'h1', contentSelector: '#content' }
+  });
+  assert.match(source.id, /^custom-/);
+  const results = parseSourceSearchHtml(`
+    <div class="result"><a class="title" href="/book/1/">示例小说</a><span class="author">作者甲</span></div>
+  `, 'https://books.example.com/search?q=test', source);
+  assert.equal(results[0].title, '示例小说');
+  assert.equal(results[0].author, '作者甲');
+  assert.equal(results[0].url, 'https://books.example.com/book/1/');
+  assert.equal(results[0].sourceId, source.id);
+});
+
+test('rejects executable or local-network source definitions', () => {
+  assert.throws(() => normalizeNovelSource({
+    version: 1,
+    name: '危险书源',
+    domains: ['example.com'],
+    script: 'eval(1)',
+    catalog: { titleSelector: 'h1', chapterSelector: 'a' },
+    chapter: { titleSelector: 'h1', contentSelector: '#content' }
+  }), /脚本/);
+  assert.throws(() => normalizeNovelSource({
+    version: 1,
+    name: '内网书源',
+    domains: ['example.com'],
+    search: {
+      url: 'http://127.0.0.1/search?q={keyword}',
+      resultSelector: '.result',
+      titleSelector: 'a',
+      urlSelector: 'a'
+    },
+    catalog: { titleSelector: 'h1', chapterSelector: 'a' },
+    chapter: { titleSelector: 'h1', contentSelector: '#content' }
+  }), /本机或局域网/);
+});
+
+test('blocks non-public network destinations and encoded loopback URLs', () => {
+  for (const address of ['127.0.0.1', '10.0.0.1', '100.64.0.1', '169.254.169.254', '192.168.1.1', '::1', 'fc00::1', 'fe80::1']) {
+    assert.equal(isBlockedNetworkAddress(address), true, address);
+  }
+  assert.throws(() => assertSafeRemoteUrl('http://2130706433/test'), /本机或局域网/);
+  assert.throws(() => assertSafeRemoteUrl('http://[::1]/test'), /本机或局域网/);
+  assert.equal(assertSafeRemoteUrl('https://example.com/book/1'), 'https://example.com/book/1');
+});
+
+test('stops reading a response while its decoded body exceeds the limit', async () => {
+  const response = new Response('正文'.repeat(100));
+  await assert.rejects(readBodyLimited(response, 64, '测试响应'), /超过 1 MB/);
+});
+
+test('keeps custom sources inside declared domains and rejects expensive selectors', () => {
+  const source = normalizeNovelSource({
+    version: 1,
+    name: '域名约束',
+    domains: ['books.example.com'],
+    search: {
+      url: 'https://books.example.com/search?q={keyword}',
+      resultSelector: '.result', titleSelector: 'a', urlSelector: 'a'
+    },
+    catalog: { titleSelector: 'h1', chapterSelector: '#list a' },
+    chapter: { titleSelector: 'h1', contentSelector: '#content' }
+  });
+  const results = parseSourceSearchHtml(`
+    <div class="result"><a href="https://evil.example/book/1">外部结果</a></div>
+    <div class="result"><a href="/book/2">正常结果</a></div>
+  `, 'https://books.example.com/search', source);
+  assert.deepEqual(results.map((item) => item.title), ['正常结果']);
+  assert.throws(() => normalizeNovelSource({
+    version: 1,
+    name: '复杂选择器',
+    domains: ['books.example.com'],
+    catalog: { titleSelector: 'h1', chapterSelector: 'body:has(a)' },
+    chapter: { titleSelector: 'h1', contentSelector: '#content' }
+  }), /安全的 CSS 选择器/);
+});
+
+test('escapes remote titles and bidirectional controls in the TypeScript disguise', () => {
+  const rendered = core.renderReader(
+    { id: 'a'.repeat(20), title: `x'); throw new Error('bad`, kind: 'online', source: 'https://example.com', chapters: [{ title: '第一章', url: 'https://example.com/1' }], addedAt: 0 },
+    { title: '第\u202e一章', content: '正文', url: 'https://example.com/1' },
+    '正常正文\u202e/* */', 0, 0, 1, 72
+  );
+  assert.match(rendered, /name: "x'\); throw new Error\('bad"/);
+  assert.doesNotMatch(rendered, /\u202e/);
+  assert.doesNotMatch(rendered, /\/\* \*\//);
 });

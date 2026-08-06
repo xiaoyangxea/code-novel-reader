@@ -11,6 +11,7 @@ export interface Book {
   author?: string;
   kind: BookKind;
   source: string;
+  sourceId?: string;
   chapters: ChapterRef[];
   addedAt: number;
 }
@@ -36,6 +37,8 @@ export interface SearchResult {
   latestChapter?: string;
   url: string;
   provider: string;
+  sourceId?: string;
+  chapterCount?: number;
 }
 
 export interface SearchProviderConfig {
@@ -47,4 +50,41 @@ export interface ParsedCatalog {
   title: string;
   author?: string;
   chapters: ChapterRef[];
+}
+
+export interface NovelSourceSearchRule {
+  url: string;
+  resultSelector: string;
+  titleSelector: string;
+  urlSelector: string;
+  authorSelector?: string;
+  latestChapterSelector?: string;
+}
+
+export interface NovelSourceCatalogRule {
+  titleSelector: string;
+  chapterSelector: string;
+  authorSelector?: string;
+}
+
+export interface NovelSourceChapterRule {
+  titleSelector: string;
+  contentSelector: string;
+  previousSelector?: string;
+  nextSelector?: string;
+  catalogSelector?: string;
+}
+
+/** A data-only source rule. Remote scripts, request headers and credentials are intentionally unsupported. */
+export interface NovelSource {
+  version: 1;
+  id: string;
+  name: string;
+  domains: string[];
+  enabled: boolean;
+  search?: NovelSourceSearchRule;
+  catalog: NovelSourceCatalogRule;
+  chapter: NovelSourceChapterRule;
+  subscriptionUrl?: string;
+  addedAt: number;
 }

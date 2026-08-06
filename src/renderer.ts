@@ -66,7 +66,17 @@ function splitDisplayLines(text: string, width: number): string[] {
 }
 
 function safeComment(line: string): string {
-  return line.replace(/\*\//g, '* /').replace(/`/g, '\\`');
+  return line
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .replace(/[\u202a-\u202e\u2066-\u2069]/gi, '')
+    .replace(/\*\//g, '* /');
+}
+
+function safeCodeString(value: string): string {
+  const normalized = value
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .replace(/[\u202a-\u202e\u2066-\u2069]/gi, '');
+  return JSON.stringify(normalized);
 }
 
 export function renderReader(
@@ -90,8 +100,8 @@ interface ParseContext {
 }
 
 const pipeline = {
-  name: '${safeComment(book.title)}',
-  stage: '${safeComment(chapter.title)}',
+  name: ${safeCodeString(book.title)},
+  stage: ${safeCodeString(chapter.title)},
   revision: ${chapterIndex + 1},
   offset: ${pageIndex + 1}
 } as const;

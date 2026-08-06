@@ -1,6 +1,6 @@
 # Code Novel Reader - 代码小说阅读器
 
-[从 VS Code Marketplace 安装](https://marketplace.visualstudio.com/items?itemName=xiaoyangxea.code-novel-reader) · [查看最新版本](https://github.com/xiaoyangxea/code-novel-reader/releases/latest) · [反馈问题](https://github.com/xiaoyangxea/code-novel-reader/issues)
+[从 VS Code Marketplace 安装](https://marketplace.visualstudio.com/items?itemName=xiaoyangxea.code-novel-reader) · [查看最新版本](https://github.com/xiaoyangxea/code-novel-reader/releases/latest) · [反馈问题](https://github.com/xiaoyangxea/code-novel-reader/issues) · [安全报告](SECURITY.md)
 
 把在线或本地小说显示为 VS Code 原生 TypeScript 文档中的 `//` 注释。阅读页面不是 Webview，语法高亮、滚动条、标签页和普通代码文件一致。
 
@@ -17,7 +17,9 @@
 - 老板键：立即用正常 TypeScript 诊断管线替换全部阅读内容。
 - 进度与缓存：逐页保存进度，在线章节抓取后本地缓存。
 - 书架清理：移除本地书籍时可同时将 TXT/EPUB 源文件移入系统回收站；移除在线书籍会清理章节缓存。
-- 可扩展搜索源：添加搜索 URL 后，使用通用表格/列表解析器提取结果。
+- 书架目录：每本书右侧提供小型目录和删除图标；目录可按章节名或序号搜索，在线目录可以刷新。
+- 书源管理：支持本地 JSON、粘贴 JSON、订阅 URL，以及根据目录 URL 自动生成安全书源。
+- 网络发现：可选接入用户自己的 Brave Search API Key，自动探测搜索结果中的小说目录。
 
 ## 安装
 
@@ -38,9 +40,10 @@
 - 放大镜：搜索在线小说。
 - 链接：粘贴目录页或章节 URL。
 - 文件夹：打开本地 TXT/EPUB。
+- 服务器图标或书架中的“书源管理”：导入、测试和管理书源。
 - 点击书架中的书名继续阅读。
 
-URL 导入完成后会弹出可搜索的章节目录。编辑器右上角的左右按钮会根据当前位置显示“上一页/下一页”，到章节边界时自动切换为“上一章/下一章”。
+书籍右侧只保留“目录”和“删除”两个小图标，右键可以继续阅读或刷新目录。URL 导入完成后会弹出可搜索的章节目录。编辑器右上角的左右按钮会根据当前位置显示“上一页/下一页”，到章节边界时自动切换为“上一章/下一章”；每次翻页或翻章后都会定位到新内容顶部。
 
 快捷键：
 
@@ -94,9 +97,54 @@ https://www.mayiwsk.com/150_150607/59106813.html
 
 如果提示 HTTP 521、连接超时或人机验证，通常表示源站/CDN 暂时不可用、代理配置有误，或页面要求浏览器验证；这类错误与网页结构识别失败不同。扩展不会绕过验证码、登录或付费限制。
 
-## 添加搜索源
+## 书源管理
 
-在 `settings.json` 中加入搜索入口，`{keyword}` 会替换为 URL 编码后的搜索词：
+在书架中点击“书源管理”，可以：
+
+- 导入本地 JSON 文件、粘贴 JSON 或订阅 URL。
+- 粘贴一本书的目录 URL，自动分析目录和第一章并生成书源。
+- 启用、禁用和测试书源；从订阅地址更新规则。
+- 复制、替换、导出或删除自己的书源。
+
+书源是纯 JSON 声明式规则，只支持 URL 模板和 CSS 选择器，不允许 JavaScript、`eval`、命令、Cookie、Authorization 或自定义请求头。例如：
+
+```json
+{
+  "version": 1,
+  "name": "示例小说网",
+  "domains": ["books.example.com"],
+  "search": {
+    "url": "https://books.example.com/search?q={keyword}",
+    "resultSelector": ".search-result",
+    "titleSelector": ".book-title",
+    "urlSelector": ".book-title",
+    "authorSelector": ".author"
+  },
+  "catalog": {
+    "titleSelector": "h1",
+    "chapterSelector": "#chapter-list a"
+  },
+  "chapter": {
+    "titleSelector": "h1",
+    "contentSelector": "#content",
+    "previousSelector": "a.prev",
+    "nextSelector": "a.next",
+    "catalogSelector": "a.catalog"
+  }
+}
+```
+
+导入书源与导入书籍 URL 是两个不同操作：书源描述一个网站的解析方式；书籍 URL 只把某一本书加入书架。直接导入书籍 URL 时，如果域名匹配已启用的自定义书源，会自动使用对应规则。
+
+### 网络发现
+
+在线搜索中可以选择“网络发现”。首次使用需要在书源管理中填写自己的 Brave Search API Key，密钥只保存到 VS Code `SecretStorage`。插件会搜索网页并对前 8 条结果探测目录，显示来源域名和识别章节数，用户确认后才导入；不会自动批量下载，也不会把结果标记为“免费正版”。搜索词会发送给 Brave，请根据自己的隐私要求决定是否启用。
+
+没有 API Key 时，可以让扩展在系统浏览器中打开搜索，然后把找到的目录 URL 粘贴回来。
+
+### 旧版兼容搜索入口
+
+旧版 `codeNovel.searchProviders` 设置仍然可用。`{keyword}` 会替换为 URL 编码后的搜索词：
 
 ```json
 {
@@ -115,6 +163,11 @@ https://www.mayiwsk.com/150_150607/59106813.html
 
 - 本地文件只在本机读取。
 - 在线导入仅请求用户选择的公开页面及其章节链接。
+- 书源和网络发现只允许 HTTP/HTTPS 地址，并拒绝明显的本机、局域网和带账号信息的 URL；单次网页响应限制为 8 MB。
+- 每次重定向都会重新验证目标；直连和代理请求都会检查全部 DNS 结果并固定到已验证的公网地址，阻止常见 SSRF 和 DNS 重绑定方式。
+- 自定义书源只能访问其 `domains` 声明的域名；复杂 CSS 选择器、跨域章节链接、过量并发和超大订阅都会被拒绝。
+- 本地 TXT/EPUB 最大 64 MB；EPUB 会在解压前检查正文展开量、单项尺寸和压缩比，防止 ZIP 压缩炸弹。
+- 网络发现默认未配置，只有用户主动选择时才会向 Brave 发送搜索词。
 - 阅读进度和在线缓存保存在 VS Code 的扩展全局存储目录。
 - 移除本地书籍时，只有明确选择“移除并删除源文件”才会把原文件移入系统回收站。
 - 老板键用于快速切换显示内容，不是加密或安全隔离功能。
@@ -126,6 +179,7 @@ https://www.mayiwsk.com/150_150607/59106813.html
 npm ci
 npm run check
 npm test
+npm run audit:security
 npm run package
 ```
 

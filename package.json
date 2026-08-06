@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -59,11 +59,28 @@
       },
       {
         "command": "codeNovel.openBook",
-        "title": "代码小说: 打开书籍"
+        "title": "代码小说: 打开书籍",
+        "icon": "$(book-open)"
       },
       {
         "command": "codeNovel.removeBook",
-        "title": "代码小说: 从书架移除"
+        "title": "代码小说: 从书架移除",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codeNovel.openCatalog",
+        "title": "代码小说: 查看目录",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "codeNovel.refreshCatalog",
+        "title": "代码小说: 更新目录",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "codeNovel.manageSources",
+        "title": "代码小说: 书源管理",
+        "icon": "$(server-environment)"
       },
       {
         "command": "codeNovel.refreshLibrary",
@@ -170,14 +187,19 @@
           "group": "navigation@3"
         },
         {
-          "command": "codeNovel.refreshLibrary",
+          "command": "codeNovel.manageSources",
           "when": "view == codeNovel.library",
           "group": "navigation@4"
+        },
+        {
+          "command": "codeNovel.refreshLibrary",
+          "when": "view == codeNovel.library",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
         {
-          "command": "codeNovel.openBook",
+          "command": "codeNovel.openCatalog",
           "when": "view == codeNovel.library && viewItem == codeNovel.book",
           "group": "inline@1"
         },
@@ -185,6 +207,16 @@
           "command": "codeNovel.removeBook",
           "when": "view == codeNovel.library && viewItem == codeNovel.book",
           "group": "inline@2"
+        },
+        {
+          "command": "codeNovel.openBook",
+          "when": "view == codeNovel.library && viewItem == codeNovel.book",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeNovel.refreshCatalog",
+          "when": "view == codeNovel.library && viewItem == codeNovel.book",
+          "group": "navigation@2"
         }
       ],
       "editor/title": [
@@ -277,6 +309,7 @@
     "watch": "node esbuild.mjs --watch",
     "check": "tsc --noEmit",
     "test": "npm run compile && node --test tests/*.test.mjs",
+    "audit:security": "npm audit --audit-level=high && npm audit signatures",
     "package": "npm run check && npm test && vsce package --no-dependencies"
   },
   "dependencies": {

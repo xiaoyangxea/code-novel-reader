@@ -1,9 +1,10 @@
 import * as cheerio from 'cheerio';
 import type { CheerioAPI } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import { ChapterContent, ChapterRef, ParsedCatalog, SearchProviderConfig, SearchResult } from './model';
+import { ChapterContent, ChapterRef, NovelSource, ParsedCatalog, SearchProviderConfig, SearchResult } from './model';
 import { FetchOptions, fetchHtml, resolveUrl } from './net';
 import { builtInSearchProviders, BuiltInSearchProvider, profileForUrl, SiteProfile } from './sites';
+import { requireSourceUrl, sourceAllowsUrl } from './source-policy';
 
 const chapterTitlePattern = /^(?:正文\s*)?(?:第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章回卷节篇部集]|chapter\s*\d+|序章|序言|楔子|引子|前言|后记|番外|尾声)/i;
 const noisePattern = /^(?:上一章|下一章|上一页|下一页|返回目录|章节目录|手机阅读|加入书签|投推荐票|请记住|最新网址|本章未完|点击下一页|喜欢.*请收藏|天才一秒记住)/i;
@@ -37,9 +38,15 @@ function hiddenSelectorsFromStyles($: CheerioAPI): string[] {
     for (const match of css.matchAll(rulePattern)) {
       if (!hiddenDeclaration.test(match[2] ?? '')) continue;
       for (const selector of (match[1] ?? '').split(',').map((value) => value.trim())) {
+        if (selectors.length >= 64) break;
         // Avoid feeding at-rules or pathological selectors into css-select.
-        if (selector && selector.length <= 120 && !selector.startsWith('@')) selectors.push(selector);
+        const combinators = selector.match(/[>+~\s]/g)?.length ?? 0;
+        if (selector && selector.length <= 120 && !selector.startsWith('@')
+          && !/:(?:has|contains|matches)\s*\(/i.test(selector) && combinators <= 16) {
+          selectors.push(selector);
+        }
       }
+      if (selectors.length >= 64) return false;
     }
   });
   return [...new Set(selectors)];
@@ -84,25 +91,32 @@ function selectContent($: CheerioAPI, profile?: SiteProfile): string {
     '.chapter-content', '.read-content', '.content_detail', '.yd_text2',
     '.txtnav', '.article-content', '.entry-content', 'article'
   ];
-  const candidates: Array<{ text: string; score: number }> = [];
+  let best: { text: string; score: number } | undefined;
+  const seen = new Set<AnyNode>();
+  let checked = 0;
+  const consider = (node: AnyNode, bonus: number, minimum: number): boolean => {
+    if (seen.has(node)) return true;
+    seen.add(node);
+    checked += 1;
+    if (checked > 300) return false;
+    const text = textWithBreaks($, node);
+    if (text.length >= minimum) {
+      const score = candidateScore(text, $(node).find('a').length) + bonus;
+      if (!best || score > best.score) best = { text, score };
+    }
+    return true;
+  };
   for (const selector of [...new Set(preferred)]) {
     $(selector).each((_, node) => {
-      const text = textWithBreaks($, node);
-      if (text.length >= 120) {
-        candidates.push({ text, score: candidateScore(text, $(node).find('a').length) + 500 });
-      }
+      if (!consider(node, 500, 120)) return false;
     });
   }
-  if (candidates.length === 0) {
+  if (!best) {
     $('main,section,div').each((_, node) => {
-      const text = textWithBreaks($, node);
-      if (text.length >= 300) {
-        candidates.push({ text, score: candidateScore(text, $(node).find('a').length) });
-      }
+      if (!consider(node, 0, 300)) return false;
     });
   }
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0]?.text ?? '';
+  return best?.text ?? '';
 }
 
 function valueFromSelector($: CheerioAPI, selector: string): string {
@@ -125,7 +139,7 @@ function titleFromPage($: CheerioAPI, profile?: SiteProfile): string {
 }
 
 function bestLink($: CheerioAPI, baseUrl: string, patterns: RegExp[]): string | undefined {
-  const matches: Array<{ url: string; rank: number }> = [];
+  let best: { url: string; rank: number } | undefined;
   $('a[href]').each((_, anchor) => {
     const label = tidy($(anchor).text()) || tidy($(anchor).attr('title') ?? '');
     const rank = patterns.findIndex((pattern) => pattern.test(label));
@@ -133,20 +147,46 @@ function bestLink($: CheerioAPI, baseUrl: string, patterns: RegExp[]): string | 
       return;
     }
     const url = resolveUrl($(anchor).attr('href'), baseUrl);
-    if (url && url !== baseUrl) {
-      matches.push({ url, rank });
-    }
+    if (url && url !== baseUrl && (!best || rank < best.rank)) best = { url, rank };
+    if (best?.rank === 0) return false;
   });
-  matches.sort((a, b) => a.rank - b.rank);
-  return matches[0]?.url;
+  return best?.url;
 }
 
-export function parseChapterHtml(html: string, url: string): ChapterContent {
+function linkFromSelector($: CheerioAPI, selector: string | undefined, baseUrl: string): string | undefined {
+  if (!selector) return undefined;
+  try {
+    const node = $(selector).first();
+    return resolveUrl(node.attr('href') ?? node.find('a[href]').first().attr('href'), baseUrl);
+  } catch {
+    return undefined;
+  }
+}
+
+function allowedSourceLink(source: NovelSource | undefined, url: string | undefined): string | undefined {
+  return !source || !url || sourceAllowsUrl(source, url) ? url : undefined;
+}
+
+function customProfile(source: NovelSource | undefined, url: string): SiteProfile | undefined {
+  if (!source) return profileForUrl(url);
+  return {
+    id: source.id,
+    name: source.name,
+    hosts: /$a/,
+    contentSelectors: [source.chapter.contentSelector],
+    catalogSelectors: [],
+    chapterTitleSelectors: [source.chapter.titleSelector],
+    bookTitleSelectors: [source.catalog.titleSelector],
+    authorSelectors: source.catalog.authorSelector ? [source.catalog.authorSelector] : []
+  };
+}
+
+export function parseChapterHtml(html: string, url: string, source?: NovelSource): ChapterContent {
   if (/cf-turnstile|cf-browser-verification|Just a moment|Checking your browser|验证码|人机验证/i.test(html)) {
     throw new Error('站点返回了人机验证页面；扩展不会绕过验证码或登录限制。');
   }
   const $ = cheerio.load(html);
-  const profile = profileForUrl(url);
+  const profile = customProfile(source, url);
   const content = selectContent($, profile);
   if (content.length < 80) {
     throw new Error('未能识别正文；页面可能需要登录、使用动态脚本，或站点规则尚未适配。');
@@ -155,15 +195,19 @@ export function parseChapterHtml(html: string, url: string): ChapterContent {
     title: titleFromPage($, profile),
     content,
     url,
-    previousUrl: bestLink($, url, [/^上一章$/i, /上一章节/i, /prev(?:ious)?\s*chapter/i, /上一页/i]),
-    nextUrl: bestLink($, url, [/^下一章$/i, /下一章节/i, /next\s*chapter/i, /下一页/i]),
-    catalogUrl: bestLink($, url, [/章节目录/i, /^目录$/i, /返回目录/i, /book\s*index/i])
+    previousUrl: allowedSourceLink(source, linkFromSelector($, source?.chapter.previousSelector, url)
+      ?? bestLink($, url, [/^上一章$/i, /上一章节/i, /prev(?:ious)?\s*chapter/i, /上一页/i])),
+    nextUrl: allowedSourceLink(source, linkFromSelector($, source?.chapter.nextSelector, url)
+      ?? bestLink($, url, [/^下一章$/i, /下一章节/i, /next\s*chapter/i, /下一页/i])),
+    catalogUrl: allowedSourceLink(source, linkFromSelector($, source?.chapter.catalogSelector, url)
+      ?? bestLink($, url, [/章节目录/i, /^目录$/i, /返回目录/i, /book\s*index/i]))
   };
 }
 
 function anchorsFromContainer($: CheerioAPI, selector: string, baseUrl: string): ChapterRef[] {
   const chapters: ChapterRef[] = [];
   $(selector).find('a[href]').each((_, anchor) => {
+    if (chapters.length >= 20_000) return false;
     const title = tidy($(anchor).text());
     const url = resolveUrl($(anchor).attr('href'), baseUrl);
     if (title && url && !catalogNoisePattern.test(title) && !/\/totaltome\//i.test(url)
@@ -238,6 +282,7 @@ function normalizeCatalogOrder(chapters: ChapterRef[], profile?: SiteProfile): C
 function inferChapterAnchors($: CheerioAPI, baseUrl: string): ChapterRef[] {
   const chapters: ChapterRef[] = [];
   $('a[href]').each((_, anchor) => {
+    if (chapters.length >= 20_000) return false;
     const title = tidy($(anchor).text());
     if (!chapterTitlePattern.test(title)) {
       return;
@@ -259,7 +304,7 @@ function authorFromPage($: CheerioAPI, profile?: SiteProfile): string | undefine
   if (explicit) {
     return explicit;
   }
-  for (const node of $('p').toArray()) {
+  for (const node of $('p').toArray().slice(0, 500)) {
     const text = tidy($(node).text());
     const match = text.match(/(?:作\s*者|作者)[：:]?\s*(.+)/);
     if (match?.[1]) {
@@ -269,27 +314,46 @@ function authorFromPage($: CheerioAPI, profile?: SiteProfile): string | undefine
   return undefined;
 }
 
-export function parseCatalogHtml(html: string, url: string): ParsedCatalog {
+export function parseCatalogHtml(html: string, url: string, source?: NovelSource): ParsedCatalog {
   if (/cf-turnstile|cf-browser-verification|Just a moment|Checking your browser|验证码|人机验证/i.test(html)) {
     throw new Error('站点返回了人机验证页面；扩展不会绕过验证码或登录限制。');
   }
   const $ = cheerio.load(html);
-  const profile = profileForUrl(url);
+  const profile = customProfile(source, url);
   const selectors = [
     ...(profile?.catalogSelectors ?? []),
     '#list', '.listmain', '.chapter-list', '.chapterlist', '.book_list',
     '.volume-list', '.catalog', '#chapter-list', '#chapters', '.zjlist'
   ];
   let chapters: ChapterRef[] = [];
-  for (const selector of selectors) {
-    const current = anchorsFromContainer($, selector, url);
-    if (current.length > chapters.length) {
-      chapters = current;
+  if (source) {
+    try {
+      const selected = $(source.catalog.chapterSelector);
+      const anchors = selected.filter('a[href]').add(selected.find('a[href]'));
+      anchors.each((_, anchor) => {
+        const title = tidy($(anchor).text()) || tidy($(anchor).attr('title') ?? '');
+        const chapterUrl = resolveUrl($(anchor).attr('href'), url);
+        if (chapters.length >= 20_000) return false;
+        if (title && chapterUrl && sourceAllowsUrl(source, chapterUrl) && !catalogNoisePattern.test(title)) {
+          chapters.push({ title, url: chapterUrl });
+        }
+      });
+      chapters = dedupeChapters(chapters);
+    } catch {
+      throw new Error('书源的目录选择器无效。');
+    }
+  } else {
+    for (const selector of selectors) {
+      const current = anchorsFromContainer($, selector, url);
+      if (current.length > chapters.length) {
+        chapters = current;
+      }
     }
   }
   if (chapters.length < 2) {
     chapters = inferChapterAnchors($, url);
   }
+  if (source) chapters = chapters.filter((chapter) => sourceAllowsUrl(source, chapter.url)).slice(0, 20_000);
   chapters = normalizeCatalogOrder(chapters, profile);
   let title = '';
   for (const selector of profile?.bookTitleSelectors ?? []) {
@@ -306,6 +370,7 @@ function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): Sear
   const results: SearchResult[] = [];
   const isBookHref = (href: string) => /(?:\/\d+[_/]\d*\/?$|\/book\/|\/novel\/|\/info\/|\/onebook\.php\?novelid=|\/wiki\/|\/ebooks\/|\/\d+\/$)/i.test(href);
   $('.grid tr,table tr,.search-list li,.result-list li,.search-result-list li,.search-result-item,.search-tab li,.bookbox,.book-item,.newbox li').each((_, row) => {
+    if (results.length >= 100) return false;
     const links = $(row).find('a[href]').toArray();
     const bookLink = links.find((link) => {
       const href = $(link).attr('href') ?? '';
@@ -333,6 +398,7 @@ function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): Sear
   });
   if (results.length === 0) {
     $('a[href]').each((_, anchor) => {
+      if (results.length >= 100) return false;
       const href = $(anchor).attr('href') ?? '';
       const title = tidy($(anchor).attr('title') ?? '') || tidy($(anchor).text());
       const url = resolveUrl(href, baseUrl);
@@ -351,7 +417,7 @@ export function parseSearchHtml(html: string, baseUrl: string, provider: string)
 
 export function parseMediaWikiSearch(json: string, provider: BuiltInSearchProvider): SearchResult[] {
   const data = JSON.parse(json) as { query?: { search?: Array<{ title?: string; snippet?: string }> } };
-  return (data.query?.search ?? []).flatMap((item) => {
+  return (data.query?.search ?? []).slice(0, 100).flatMap((item) => {
     if (!item.title) return [];
     return [{
       title: item.title,
@@ -365,7 +431,7 @@ export function parseMediaWikiSearch(json: string, provider: BuiltInSearchProvid
 export function parseZonghengSearch(json: string, provider: BuiltInSearchProvider): SearchResult[] {
   type Item = { bookId?: number; name?: string; authorName?: string; chapterName?: string };
   const data = JSON.parse(json) as { data?: { datas?: { list?: Item[] } } };
-  return (data.data?.datas?.list ?? []).flatMap((item) => {
+  return (data.data?.datas?.list ?? []).slice(0, 100).flatMap((item) => {
     if (!item.bookId || !item.name) return [];
     return [{
       title: item.name.replace(/<[^>]+>/g, ''),
@@ -402,23 +468,29 @@ export async function searchBooks(
     providers = providers.filter((provider) => providerFilter.includes(provider.name));
   }
   const errors: string[] = [];
-  const batches = await Promise.all(providers.map(async (provider) => {
-    const url = provider.url.replaceAll('{keyword}', encodeURIComponent(keyword));
-    try {
-      const html = await fetchHtml(url, options);
-      if (provider.kind === 'mediawiki') return parseMediaWikiSearch(html, provider);
-      if (provider.kind === 'zongheng') return parseZonghengSearch(html, provider);
-      return parseSearchHtml(html, url, provider.name);
-    } catch (error) {
-      errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
-      return [];
-    }
-  }));
-  return { results: dedupeSearch(batches.flat()), errors };
+  providers = providers.slice(0, 50);
+  const results: SearchResult[] = [];
+  for (let offset = 0; offset < providers.length; offset += 5) {
+    const batch = await Promise.all(providers.slice(offset, offset + 5).map(async (provider) => {
+      const url = provider.url.replaceAll('{keyword}', encodeURIComponent(keyword));
+      try {
+        const html = await fetchHtml(url, options);
+        if (provider.kind === 'mediawiki') return parseMediaWikiSearch(html, provider);
+        if (provider.kind === 'zongheng') return parseZonghengSearch(html, provider);
+        return parseSearchHtml(html, url, provider.name);
+      } catch (error) {
+        errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
+        return [];
+      }
+    }));
+    results.push(...batch.flat());
+  }
+  return { results: dedupeSearch(results), errors };
 }
 
-export async function loadCatalog(url: string, options: FetchOptions): Promise<ParsedCatalog> {
-  return parseCatalogHtml(await fetchHtml(url, options), url);
+export async function loadCatalog(url: string, options: FetchOptions, source?: NovelSource): Promise<ParsedCatalog> {
+  if (source) requireSourceUrl(source, url);
+  return parseCatalogHtml(await fetchHtml(url, options), url, source);
 }
 
 async function includeSiteStyles(html: string, url: string, options: FetchOptions): Promise<string> {
@@ -435,7 +507,7 @@ async function includeSiteStyles(html: string, url: string, options: FetchOption
   }).slice(0, 4);
   if (stylesheetUrls.length === 0) return html;
   const settled = await Promise.allSettled(stylesheetUrls.map((stylesheetUrl) =>
-    fetchHtml(stylesheetUrl, { ...options, referer: url })
+    fetchHtml(stylesheetUrl, { ...options, referer: url, maxBytes: 500_000 })
   ));
   const css = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value.slice(0, 500_000)] : []).join('\n');
   if (!css) return html;
@@ -443,9 +515,10 @@ async function includeSiteStyles(html: string, url: string, options: FetchOption
   return /<\/head>/i.test(html) ? html.replace(/<\/head>/i, `${styleTag}</head>`) : `${styleTag}${html}`;
 }
 
-export async function loadChapter(url: string, options: FetchOptions): Promise<ChapterContent> {
+export async function loadChapter(url: string, options: FetchOptions, source?: NovelSource): Promise<ChapterContent> {
+  if (source) requireSourceUrl(source, url);
   const html = await fetchHtml(url, { ...options, referer: url });
-  return parseChapterHtml(await includeSiteStyles(html, url, options), url);
+  return parseChapterHtml(await includeSiteStyles(html, url, options), url, source);
 }
 
 export function likelyCatalogUrl(chapterUrl: string): string | undefined {

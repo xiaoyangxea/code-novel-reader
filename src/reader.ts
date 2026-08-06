@@ -1,9 +1,9 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { loadChapter } from './adapters';
-import { parseEpub, ParsedLocalBook, parsePlainText } from './local';
+import { maxLocalBookBytes, parseEpub, ParsedLocalBook, parsePlainText } from './local';
 import { Book, ChapterContent, ReadingProgress } from './model';
-import { BookRepository } from './repository';
+import { BookRepository, SourceRepository } from './repository';
 import { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
 
 export class ReaderDocumentProvider implements vscode.TextDocumentContentProvider {
@@ -30,10 +30,12 @@ export class ReaderController {
   private bossMode = false;
   private editor?: vscode.TextEditor;
   private readonly localCache = new Map<string, ParsedLocalBook>();
+  private revealRevision = 0;
 
   constructor(
     private readonly repository: BookRepository,
-    private readonly provider: ReaderDocumentProvider
+    private readonly provider: ReaderDocumentProvider,
+    private readonly sources: SourceRepository
   ) {}
 
   private config() {
@@ -52,7 +54,10 @@ export class ReaderController {
     if (cached) {
       return cached;
     }
-    const bytes = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(book.source)));
+    const uri = vscode.Uri.file(book.source);
+    const stat = await vscode.workspace.fs.stat(uri);
+    if (stat.size > maxLocalBookBytes) throw new Error('本地小说文件超过 64 MB，已拒绝读取。');
+    const bytes = Buffer.from(await vscode.workspace.fs.readFile(uri));
     const parsed = book.kind === 'epub'
       ? await parseEpub(bytes, book.source)
       : parsePlainText(bytes, book.source);
@@ -84,7 +89,7 @@ export class ReaderController {
         return cached;
       }
     }
-    const chapter = await loadChapter(reference.url, this.config());
+    const chapter = await loadChapter(reference.url, this.config(), this.sources.getSource(book.sourceId));
     await this.repository.cacheChapter(book.id, chapter);
     return chapter;
   }
@@ -147,7 +152,7 @@ export class ReaderController {
       this.provider.update(renderBoss());
       return;
     }
-    this.provider.update(renderReader(
+    const content = renderReader(
       this.activeBook,
       this.chapter,
       this.pages[this.progress.pageIndex] ?? '',
@@ -155,8 +160,9 @@ export class ReaderController {
       this.progress.pageIndex,
       this.pages.length,
       this.config().commentWidth
-    ));
-    this.revealReadingArea();
+    );
+    this.provider.update(content);
+    void this.revealReadingArea(content);
   }
 
   private updateNavigationContext(): void {
@@ -168,16 +174,27 @@ export class ReaderController {
     void vscode.commands.executeCommand('setContext', 'codeNovel.bossMode', this.bossMode);
   }
 
-  private revealReadingArea(): void {
-    setTimeout(() => {
-      if (!this.editor || this.bossMode) {
-        return;
+  private async revealReadingArea(expectedContent: string): Promise<void> {
+    const revision = ++this.revealRevision;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (revision !== this.revealRevision || !this.editor || this.bossMode) return;
+      if (this.editor.document.getText() !== expectedContent) continue;
+      let bodyLine = -1;
+      for (let line = 12; line < this.editor.document.lineCount; line += 1) {
+        const text = this.editor.document.lineAt(line).text;
+        if (text.startsWith('// trace:')) break;
+        if (/^\s*\/\/ /.test(text)) {
+          bodyLine = line;
+          break;
+        }
       }
-      const line = Math.min(16, Math.max(this.editor.document.lineCount - 1, 0));
+      const line = bodyLine >= 0 ? bodyLine : Math.min(16, Math.max(this.editor.document.lineCount - 1, 0));
       const position = new vscode.Position(line, 0);
       this.editor.selection = new vscode.Selection(position, position);
       this.editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.AtTop);
-    }, 30);
+      return;
+    }
   }
 
   private async persistProgress(): Promise<void> {
@@ -266,6 +283,15 @@ export class ReaderController {
     this.progress.chapterIndex = picked.index;
     this.progress.pageIndex = 0;
     await this.loadWithFeedback();
+  }
+
+  async openBookAtChapter(book: Book, chapterIndex: number): Promise<void> {
+    await this.repository.saveProgress(book.id, {
+      chapterIndex: Math.min(Math.max(chapterIndex, 0), Math.max(book.chapters.length - 1, 0)),
+      pageIndex: 0,
+      updatedAt: Date.now()
+    });
+    await this.openBook(book);
   }
 
   toggleBoss(): void {

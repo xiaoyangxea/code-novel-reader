@@ -7,6 +7,7 @@ export {
   parseZonghengSearch,
   searchBooks
 } from './adapters';
-export { parseEpub, parsePlainText } from './local';
-export { fetchHtml } from './net';
+export { parseEpub, parsePlainText, validateEpubArchive } from './local';
+export { assertSafeRemoteUrl, fetchHtml, isBlockedNetworkAddress, readBodyLimited } from './net';
 export { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
+export { normalizeNovelSource, parseSourceSearchHtml } from './source-rules';
