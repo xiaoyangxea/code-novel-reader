@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import * as cheerio from 'cheerio';
+import * as cheerio from 'cheerio/slim';
 import * as iconv from 'iconv-lite';
 import JSZip from 'jszip';
 import { ChapterContent, ChapterRef } from './model';

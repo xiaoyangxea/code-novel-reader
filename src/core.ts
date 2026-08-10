@@ -9,10 +9,12 @@ export {
   parseZonghengSearch,
   searchBooks,
   loadCatalog,
+  loadCatalogPreview,
   loadChapter
 } from './adapters';
 export { parseEpub, parsePlainText, validateEpubArchive } from './local';
 export { assertSafeRemoteUrl, resolveSafeRemoteUrl, fetchHtml, isBlockedNetworkAddress, readBodyLimited } from './net';
-export { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
+export { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
 export { normalizeNovelSource, parseSourceSearchHtml } from './source-rules';
-export { findBrowserExecutable, startVerificationBrowser } from './browser';
+export { BrowserAutomationBlockedError, browserIsolationArguments, findBrowserExecutable, isBrowserChallengeHtml, renderHtmlBatchWithBrowser, renderHtmlWithBrowser, startVerificationBrowser } from './browser';
+export { readChromiumCachedHtml, readChromiumCachedHtmlBatch } from './chromium-cache';

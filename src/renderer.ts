@@ -10,6 +10,18 @@ export function pageNavigationState(pageIndex: number, pageCount: number): {
   };
 }
 
+export function chapterPrefetchIndexes(
+  currentChapterIndex: number,
+  chapterCount: number,
+  requestedCount: number
+): number[] {
+  if (!Number.isFinite(currentChapterIndex) || !Number.isFinite(chapterCount) || !Number.isFinite(requestedCount)) return [];
+  const count = Math.min(Math.max(Math.floor(requestedCount), 0), 10);
+  const start = Math.max(Math.floor(currentChapterIndex) + 1, 0);
+  const end = Math.min(Math.max(Math.floor(chapterCount), 0), start + count);
+  return Array.from({ length: Math.max(end - start, 0) }, (_, offset) => start + offset);
+}
+
 export function paginate(content: string, targetCharacters: number): string[] {
   const paragraphs = content.replace(/\r/g, '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
   const pages: string[] = [];

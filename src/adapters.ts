@@ -1,7 +1,7 @@
-import * as cheerio from 'cheerio';
+import * as cheerio from 'cheerio/slim';
 import type { CheerioAPI } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import { BrowserVerificationRequiredError, renderHtmlWithBrowser } from './browser';
+import { BrowserAutomationBlockedError, BrowserVerificationRequiredError, isBrowserChallengeHtml, renderHtmlBatchWithBrowser, renderHtmlWithBrowser } from './browser';
 import { ChapterContent, ChapterRef, NovelSource, ParsedCatalog, SearchProviderConfig, SearchResult } from './model';
 import { FetchOptions, fetchHtml, resolveUrl } from './net';
 import { builtInSearchProviders, BuiltInSearchProvider, profileForUrl, SiteProfile } from './sites';
@@ -10,7 +10,12 @@ import { requireSourceUrl, sourceAllowsUrl } from './source-policy';
 const chapterTitlePattern = /^(?:正文\s*)?(?:第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章回卷节篇部集]|chapter\s*\d+|序章|序言|楔子|引子|前言|后记|番外|尾声)/i;
 const noisePattern = /^(?:上一章|下一章|上一页|下一页|返回目录|章节目录|手机阅读|加入书签|投推荐票|请记住|最新网址|本章未完|点击下一页|喜欢.*请收藏|天才一秒记住)/i;
 const catalogNoisePattern = /^(?:分卷阅读|展开|收起|返回|目录|全部章节|加入书架|立即阅读|下载|点击查看)/i;
-const challengePattern = /cf-turnstile|cf-browser-verification|Just a moment|Checking your browser|challenge-platform|Cloudflare Ray ID|验证码|人机验证|请稍候/i;
+const browserPreferenceLifetimeMs = 30 * 60 * 1000;
+const browserPreferredUntil = new Map<string, number>();
+
+function browserIsPreferred(url: string): boolean {
+  return (browserPreferredUntil.get(new URL(url).origin) ?? 0) > Date.now();
+}
 
 function tidy(value: string): string {
   return value.replace(/\u00a0/g, ' ').replace(/[\t\r]+/g, ' ').replace(/ {2,}/g, ' ').trim();
@@ -32,7 +37,7 @@ function cleanNovelText(value: string): string {
 }
 
 function assertReadablePage(html: string): void {
-  if (challengePattern.test(html)) {
+  if (isBrowserChallengeHtml(html)) {
     throw new Error('站点返回了人机验证页面；需要使用插件的专用浏览器验证。');
   }
 }
@@ -568,18 +573,33 @@ async function browserFallback<T>(
   staticAttempt: () => Promise<T>,
   renderedAttempt: (html: string) => Promise<T> | T
 ): Promise<T> {
+  const preferenceKey = new URL(url).origin;
+  if (options.browserRendering !== false && browserIsPreferred(url)) {
+    try {
+      const html = await renderHtmlWithBrowser(url, options);
+      return await renderedAttempt(html);
+    } catch (error) {
+      browserPreferredUntil.delete(preferenceKey);
+      if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
+      // Retry through the ordinary request path in case the site's behavior changed.
+    }
+  }
   let staticError: unknown;
   try {
-    return await staticAttempt();
+    const result = await staticAttempt();
+    browserPreferredUntil.delete(preferenceKey);
+    return result;
   } catch (error) {
     staticError = error;
   }
   if (options.browserRendering === false) throw staticError;
   try {
     const html = await renderHtmlWithBrowser(url, options);
-    return await renderedAttempt(html);
+    const result = await renderedAttempt(html);
+    browserPreferredUntil.set(preferenceKey, Date.now() + browserPreferenceLifetimeMs);
+    return result;
   } catch (error) {
-    if (error instanceof BrowserVerificationRequiredError) throw error;
+    if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
     throw new Error(`普通抓取失败：${errorMessage(staticError)}；浏览器渲染也失败：${errorMessage(error)}`);
   }
 }
@@ -588,6 +608,11 @@ async function loadCatalogPage(url: string, options: FetchOptions, source?: Nove
   const parse = (html: string) => ({ html, catalog: parseCatalogHtml(html, url, source) });
   const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
   return browserFallback(url, limited, async () => parse(await fetchHtml(url, limited)), parse);
+}
+
+export async function loadCatalogPreview(url: string, options: FetchOptions, source?: NovelSource): Promise<ParsedCatalog> {
+  if (source) requireSourceUrl(source, url);
+  return (await loadCatalogPage(url, options, source)).catalog;
 }
 
 export function chapterPageState(html: string, url: string, source?: NovelSource): { current?: number; total?: number; nextPageUrl?: string } {
@@ -628,12 +653,19 @@ async function loadChapterPage(
   options: FetchOptions,
   source?: NovelSource
 ): Promise<{ html: string; chapter: ChapterContent; page: ReturnType<typeof chapterPageState> }> {
-  const parse = async (html: string) => {
-    const styled = await includeSiteStyles(html, url, options);
-    return { html: styled, chapter: parseChapterHtml(styled, url, source), page: chapterPageState(styled, url, source) };
-  };
+  const parse = (html: string) => parseLoadedChapterPage(html, url, options, source);
   const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
   return browserFallback(url, limited, async () => parse(await fetchHtml(url, { ...limited, referer: url })), parse);
+}
+
+async function parseLoadedChapterPage(
+  html: string,
+  url: string,
+  options: FetchOptions,
+  source?: NovelSource
+): Promise<{ html: string; chapter: ChapterContent; page: ReturnType<typeof chapterPageState> }> {
+  const styled = await includeSiteStyles(html, url, options);
+  return { html: styled, chapter: parseChapterHtml(styled, url, source), page: chapterPageState(styled, url, source) };
 }
 
 export async function searchBooks(
@@ -694,16 +726,80 @@ export async function loadCatalog(url: string, options: FetchOptions, source?: N
   const queue = catalogPageUrls(first.html, url);
   const visited = new Set<string>([new URL(url).toString()]);
   const maxPages = Math.min(Math.max(profile.maxCatalogPages ?? 20, 1), 100);
+  const appendPage = (html: string, pageUrl: string) => {
+    const pageCatalog = parseCatalogHtml(html, pageUrl);
+    chapters.push(...pageCatalog.chapters);
+    for (const discovered of catalogPageUrls(html, pageUrl)) {
+      if (!visited.has(discovered) && !queue.includes(discovered)) queue.push(discovered);
+    }
+  };
+
+  if ((profile.id === 'qidiy' || profile.id === 'kudushu') && queue.length > 0) {
+    let cursor = 0;
+    let loadedPages = 1;
+    while (cursor < queue.length && visited.size < maxPages && chapters.length < 20_000) {
+      const batch: string[] = [];
+      while (cursor < queue.length && batch.length < 5 && visited.size < maxPages) {
+        const pageUrl = queue[cursor];
+        cursor += 1;
+        if (!pageUrl || visited.has(pageUrl)) continue;
+        visited.add(pageUrl);
+        batch.push(pageUrl);
+      }
+      if (batch.length === 0) continue;
+      const totalPages = Math.min(Math.max(queue.length + 1, loadedPages + batch.length), maxPages);
+      options.onProgress?.(`正在读取目录分页 ${loadedPages + 1}-${loadedPages + batch.length} / ${totalPages}`);
+      if (profile.catalogDelayMs) await new Promise((resolve) => setTimeout(resolve, profile.catalogDelayMs));
+      try {
+        const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
+        let rendered: Map<string, string>;
+        if (profile.id !== 'qidiy' && !browserIsPreferred(url)) {
+          try {
+            const pages = await Promise.all(batch.map(async (pageUrl) => {
+              const html = await fetchHtml(pageUrl, limited);
+              assertReadablePage(html);
+              return [new URL(pageUrl).toString(), html] as const;
+            }));
+            rendered = new Map(pages);
+          } catch (error) {
+            if (options.browserRendering === false) throw error;
+            rendered = await renderHtmlBatchWithBrowser(batch, limited);
+            browserPreferredUntil.set(new URL(url).origin, Date.now() + browserPreferenceLifetimeMs);
+          }
+        } else {
+          rendered = await renderHtmlBatchWithBrowser(batch, limited);
+          browserPreferredUntil.set(new URL(url).origin, Date.now() + browserPreferenceLifetimeMs);
+        }
+        for (const pageUrl of batch) {
+          const html = rendered.get(new URL(pageUrl).toString());
+          if (!html) throw new Error(`普通浏览器没有返回目录分页：${pageUrl}`);
+          appendPage(html, pageUrl);
+        }
+      } catch (error) {
+        if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
+        if (options.browserRendering === false) throw error;
+        for (const pageUrl of batch) {
+          const page = await loadCatalogPage(pageUrl, options);
+          appendPage(page.html, pageUrl);
+        }
+      }
+      loadedPages += batch.length;
+    }
+    return {
+      title: first.catalog.title,
+      author: first.catalog.author,
+      chapters: normalizeCatalogOrder(dedupeChapters(chapters).slice(0, 20_000), profile)
+    };
+  }
+
   for (let index = 0; index < queue.length && visited.size < maxPages; index += 1) {
     const pageUrl = queue[index];
     if (!pageUrl || visited.has(pageUrl)) continue;
     visited.add(pageUrl);
+    options.onProgress?.(`正在读取目录分页 ${Math.min(index + 2, maxPages)} / ${Math.min(Math.max(queue.length + 1, index + 2), maxPages)}`);
     if (profile.catalogDelayMs) await new Promise((resolve) => setTimeout(resolve, profile.catalogDelayMs));
     const page = await loadCatalogPage(pageUrl, options);
-    chapters.push(...page.catalog.chapters);
-    for (const discovered of catalogPageUrls(page.html, pageUrl)) {
-      if (!visited.has(discovered) && !queue.includes(discovered)) queue.push(discovered);
-    }
+    appendPage(page.html, pageUrl);
     if (chapters.length >= 20_000) break;
   }
   return {
@@ -735,6 +831,37 @@ async function includeSiteStyles(html: string, url: string, options: FetchOption
   return /<\/head>/i.test(html) ? html.replace(/<\/head>/i, `${styleTag}</head>`) : `${styleTag}${html}`;
 }
 
+async function loadChapterPageBatch(
+  urls: string[],
+  options: FetchOptions
+): Promise<Array<{ html: string; chapter: ChapterContent; page: ReturnType<typeof chapterPageState> }>> {
+  const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
+  if (!browserIsPreferred(urls[0] ?? 'https://invalid.invalid')) {
+    try {
+      return await Promise.all(urls.map(async (pageUrl) => {
+        const html = await fetchHtml(pageUrl, { ...limited, referer: pageUrl });
+        return parseLoadedChapterPage(html, pageUrl, limited);
+      }));
+    } catch (error) {
+      if (options.browserRendering === false) throw error;
+    }
+  }
+  try {
+    const rendered = await renderHtmlBatchWithBrowser(urls, limited);
+    browserPreferredUntil.set(new URL(urls[0]!).origin, Date.now() + browserPreferenceLifetimeMs);
+    return await Promise.all(urls.map((pageUrl) => {
+      const html = rendered.get(new URL(pageUrl).toString());
+      if (!html) throw new Error(`普通浏览器没有返回正文分页：${pageUrl}`);
+      return parseLoadedChapterPage(html, pageUrl, limited);
+    }));
+  } catch (error) {
+    if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
+    const pages = [];
+    for (const pageUrl of urls) pages.push(await loadChapterPage(pageUrl, options));
+    return pages;
+  }
+}
+
 export async function loadChapter(url: string, options: FetchOptions, source?: NovelSource): Promise<ChapterContent> {
   if (source) requireSourceUrl(source, url);
   const first = await loadChapterPage(url, options, source);
@@ -742,11 +869,49 @@ export async function loadChapter(url: string, options: FetchOptions, source?: N
 
   const contents = [first.chapter.content];
   const visited = new Set<string>([new URL(url).toString()]);
+  const profile = profileForUrl(url);
+
+  if ((profile?.id === 'qidiy' || profile?.id === 'kudushu')
+    && profile.inferChapterPageUrl && first.page.current && first.page.total
+    && first.page.current < first.page.total && first.page.total <= 20) {
+    const inferred: string[] = [];
+    const inferredSeen = new Set(visited);
+    for (let pageNumber = first.page.current + 1; pageNumber <= first.page.total; pageNumber += 1) {
+      const pageUrl = profile.inferChapterPageUrl(new URL(url), pageNumber);
+      if (!pageUrl || inferredSeen.has(pageUrl) || new URL(pageUrl).hostname !== new URL(url).hostname) {
+        inferred.length = 0;
+        break;
+      }
+      inferredSeen.add(pageUrl);
+      inferred.push(pageUrl);
+    }
+    if (inferred.length > 0) {
+      const pages = [];
+      for (let offset = 0; offset < inferred.length; offset += 5) {
+        const batch = inferred.slice(offset, offset + 5);
+        const firstNumber = first.page.current + offset + 1;
+        options.onProgress?.(`正在读取正文分页 ${firstNumber}-${firstNumber + batch.length - 1} / ${first.page.total}`);
+        pages.push(...await loadChapterPageBatch(batch, options));
+      }
+      const current = pages.at(-1)!;
+      if (current.page.current && current.page.total && current.page.current < current.page.total) {
+        throw new Error(`章节分页不完整：只读取到第 ${current.page.current}/${current.page.total} 页。`);
+      }
+      return {
+        ...first.chapter,
+        content: [first.chapter.content, ...pages.map((page) => page.chapter.content)].join('\n\n'),
+        nextUrl: current.chapter.nextUrl,
+        catalogUrl: first.chapter.catalogUrl ?? current.chapter.catalogUrl
+      };
+    }
+  }
+
   let current = first;
   for (let pageCount = 1; pageCount < 20 && current.page.nextPageUrl; pageCount += 1) {
     const pageUrl = current.page.nextPageUrl;
     if (visited.has(pageUrl)) throw new Error('章节分页形成了循环，已停止读取。');
     visited.add(pageUrl);
+    options.onProgress?.(`正在读取正文分页 ${pageCount + 1}${current.page.total ? ` / ${current.page.total}` : ''}`);
     current = await loadChapterPage(pageUrl, options);
     contents.push(current.chapter.content);
   }

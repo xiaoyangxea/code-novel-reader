@@ -1,6 +1,7 @@
 import * as esbuild from 'esbuild';
 
 const watch = process.argv.includes('--watch');
+const production = process.argv.includes('--production');
 const options = {
   entryPoints: {
     extension: 'src/extension.ts',
@@ -12,6 +13,7 @@ const options = {
   format: 'cjs',
   platform: 'node',
   target: 'node20',
+  minify: production,
   sourcemap: true,
   logLevel: 'info'
 };

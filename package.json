@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -303,6 +303,18 @@
           "maximum": 60000,
           "description": "浏览器渲染网页的超时时间（毫秒）。"
         },
+        "codeNovel.prefetchNextChapter": {
+          "type": "boolean",
+          "default": true,
+          "description": "阅读在线小说时，在后台预取后续章节以加快连续翻章。"
+        },
+        "codeNovel.prefetchChapterCount": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 10,
+          "description": "在线阅读时始终尝试缓存当前章节之后的章节数；设为 0 可停止预取。"
+        },
         "codeNovel.searchProviders": {
           "type": "array",
           "default": [],
@@ -328,11 +340,12 @@
   },
   "scripts": {
     "compile": "node esbuild.mjs",
+    "compile:production": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
     "check": "tsc --noEmit",
     "test": "npm run compile && node --test tests/*.test.mjs",
     "audit:security": "npm audit --audit-level=high && npm audit signatures",
-    "package": "npm run check && npm test && vsce package --no-dependencies"
+    "package": "npm run check && npm test && npm run compile:production && vsce package --no-dependencies"
   },
   "dependencies": {
     "cheerio": "^1.1.2",

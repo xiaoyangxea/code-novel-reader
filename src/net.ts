@@ -26,6 +26,7 @@ export interface FetchOptions {
   browserExecutable?: string;
   browserDataDirectory?: string;
   browserTimeoutMs?: number;
+  onProgress?: (message: string) => void;
 }
 
 interface DownloadedResponse {

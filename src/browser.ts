@@ -1,18 +1,27 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, mkdir } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
+import { readChromiumCachedHtmlBatch } from './chromium-cache';
 import { resolveSafeRemoteUrl, type FetchOptions } from './net';
 
 const maxRenderedBytes = 8_000_000;
+const verificationAttemptLifetimeMs = 30 * 60 * 1000;
+const normalBrowserPreferenceLifetimeMs = 30 * 60 * 1000;
 let browserQueue: Promise<void> = Promise.resolve();
+const executableCache = new Map<string, string>();
+const normalBrowserPreferredUntil = new Map<string, number>();
 
-const browserIsolationArgs = [
+export const browserIsolationArguments = Object.freeze([
   '--disable-extensions', '--disable-sync', '--disable-background-networking',
   '--disable-component-update', '--disable-default-apps', '--disable-domain-reliability',
   '--no-first-run', '--no-default-browser-check', '--disable-notifications',
-  '--disable-background-mode', '--password-store=basic'
-];
+  '--disable-background-mode', '--password-store=basic',
+  // The isolated profile is intentionally terminated after a capture. Suppress
+  // browser-owned UI that would otherwise cover the novel page on a later run.
+  '--disable-translate', '--disable-features=TranslateUI',
+  '--hide-crash-restore-bubble', '--disable-session-crashed-bubble'
+]);
 
 function hostResolverArgument(rawUrl: string, address: string): string {
   const hostname = new URL(rawUrl).hostname.replace(/^\[|\]$/g, '');
@@ -24,6 +33,13 @@ export class BrowserVerificationRequiredError extends Error {
   constructor(readonly url: string) {
     super('站点需要浏览器验证。请使用插件的专用验证窗口完成一次验证后重试。');
     this.name = 'BrowserVerificationRequiredError';
+  }
+}
+
+export class BrowserAutomationBlockedError extends Error {
+  constructor(readonly url: string) {
+    super('该站点在普通浏览器中可以打开，但仍拒绝插件自动读取页面。重复打开验证窗口无法解决；当前不能直接导入该站，可暂时使用本地 TXT/EPUB。');
+    this.name = 'BrowserAutomationBlockedError';
   }
 }
 
@@ -58,9 +74,13 @@ function candidatePaths(configured?: string): string[] {
 }
 
 export async function findBrowserExecutable(configured?: string): Promise<string | undefined> {
+  const cacheKey = configured ? path.resolve(configured) : '<automatic>';
+  const cached = executableCache.get(cacheKey);
+  if (cached) return cached;
   for (const candidate of candidatePaths(configured)) {
     try {
       await access(candidate);
+      executableCache.set(cacheKey, candidate);
       return candidate;
     } catch {
       // Try the next standard installation location.
@@ -75,8 +95,36 @@ function siteProfileDirectory(root: string, rawUrl: string): string {
   return path.join(root, id);
 }
 
-function isChallengePage(html: string): boolean {
-  return /Just a moment|Checking your browser|challenge-platform|cf-turnstile|cf-browser-verification|Cloudflare Ray ID|验证码|人机验证|请稍候/i.test(html);
+function verificationAttemptPath(profile: string): string {
+  return path.join(profile, '.verification-attempted');
+}
+
+async function hasRecentVerificationAttempt(profile: string): Promise<boolean> {
+  try {
+    const info = await stat(verificationAttemptPath(profile));
+    return Date.now() - info.mtimeMs <= verificationAttemptLifetimeMs;
+  } catch {
+    return false;
+  }
+}
+
+export function isBrowserChallengeHtml(html: string): boolean {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/<[^>]+>/g, ' ').trim() ?? '';
+  if (/Just a moment|Checking your browser|安全验证|人机验证|请稍候/i.test(title)) return true;
+
+  // Some sites retain challenge-related scripts after serving a valid chapter. A
+  // substantial page with a normal reader/catalog container must not be rejected.
+  const readableStructure = /(?:id|class)\s*=\s*["'][^"']*(?:chaptercontent|chapter-content|novelcontent|booktxt|read-content|section-list|full_chapters|chapter-list|catalog|\bcontent\b|\bcon\b)[^"']*["']/i.test(html);
+  if (readableStructure && html.length >= 2000) return false;
+  if (/cf-turnstile|cf-browser-verification|challenge-platform|cdn-cgi\/challenge-platform|Cloudflare Ray ID/i.test(html)) return true;
+
+  const visibleText = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return visibleText.length < 1500 && /验证码|人机验证|完成安全验证|请稍候/i.test(visibleText);
 }
 
 async function queued<T>(operation: () => Promise<T>): Promise<T> {
@@ -112,6 +160,157 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<{ code: nu
   });
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function hasDesktopSession(): boolean {
+  return process.platform === 'win32' || process.platform === 'darwin'
+    || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+async function stopOwnedBrowser(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.killed) return;
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  child.kill();
+  await Promise.race([exited, delay(2000)]);
+}
+
+async function renderHeadlessHtml(
+  executable: string,
+  safeUrl: string,
+  address: string,
+  profile: string,
+  timeoutMs: number,
+  renderedLimit: number
+): Promise<string> {
+  const args = [
+    '--headless=new', '--disable-gpu', '--mute-audio', '--no-proxy-server', ...browserIsolationArguments,
+    hostResolverArgument(safeUrl, address), `--user-data-dir=${profile}`,
+    `--virtual-time-budget=${Math.max(timeoutMs - 2_000, 5_000)}`, '--dump-dom', safeUrl
+  ];
+  const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let overflow = false;
+  child.stdout?.on('data', (chunk: Buffer) => {
+    if (overflow) return;
+    total += chunk.length;
+    if (total > renderedLimit) {
+      overflow = true;
+      child.kill();
+      return;
+    }
+    chunks.push(Buffer.from(chunk));
+  });
+  const { code, stderr } = await waitForExit(child, timeoutMs);
+  if (overflow) throw new Error(`浏览器渲染后的页面超过 ${Math.ceil(renderedLimit / 1_000_000)} MB，已停止读取。`);
+  const html = Buffer.concat(chunks, total).toString('utf8');
+  if (isBrowserChallengeHtml(html)) throw new BrowserVerificationRequiredError(safeUrl);
+  if (!html.trim() || (code !== 0 && html.length < 200)) {
+    throw new Error(`浏览器渲染失败${code === null ? '' : `（退出码 ${code}）`}${stderr ? `：${stderr.trim().slice(0, 300)}` : ''}`);
+  }
+  return html;
+}
+
+async function renderFromNormalBrowserCache(
+  executable: string,
+  safeUrls: string[],
+  address: string,
+  profile: string,
+  cacheDirectoryRoot: string,
+  timeoutMs: number,
+  renderedLimit: number
+): Promise<Map<string, string>> {
+  const safeUrl = safeUrls[0];
+  if (!safeUrl) throw new Error('没有可供普通浏览器读取的 URL。');
+  await mkdir(cacheDirectoryRoot, { recursive: true });
+  const cacheRoot = await mkdtemp(path.join(cacheDirectoryRoot, 'request-'));
+  const args = [
+    '--disable-gpu', '--mute-audio', '--no-proxy-server', ...browserIsolationArguments,
+    '--start-minimized', '--window-size=800,600',
+    hostResolverArgument(safeUrl, address), `--user-data-dir=${profile}`, `--disk-cache-dir=${cacheRoot}`,
+    '--new-window', ...safeUrls
+  ];
+  const child = spawn(executable, args, { stdio: 'ignore', windowsHide: true });
+  let spawnError: Error | undefined;
+  let exitCode: number | null | undefined;
+  child.once('error', (error) => { spawnError = error; });
+  child.once('exit', (code) => { exitCode = code; });
+  const deadline = Date.now() + timeoutMs;
+  const challengeUrls = new Set<string>();
+  let firstChallengeAt: number | undefined;
+  const results = new Map<string, string>();
+  try {
+    while (Date.now() < deadline) {
+      if (spawnError) throw spawnError;
+      const pendingUrls = safeUrls.filter((targetUrl) => !results.has(targetUrl));
+      const cached = await readChromiumCachedHtmlBatch(cacheRoot, pendingUrls, renderedLimit);
+      for (const [targetUrl, html] of cached) {
+        if (isBrowserChallengeHtml(html)) {
+          challengeUrls.add(targetUrl);
+          firstChallengeAt ??= Date.now();
+        } else {
+          results.set(targetUrl, html);
+        }
+      }
+      if (results.size === safeUrls.length) return results;
+      if (firstChallengeAt && Date.now() - firstChallengeAt >= Math.min(10_000, Math.max(timeoutMs - 2_000, 3_000))) {
+        throw new BrowserVerificationRequiredError([...challengeUrls][0] ?? safeUrl);
+      }
+      if (exitCode !== undefined) {
+        throw new Error(`普通浏览器提前退出${exitCode === null ? '' : `（退出码 ${exitCode}）`}。请先关闭仍在运行的专用验证窗口后重试。`);
+      }
+      await delay(200);
+    }
+    if (challengeUrls.size > 0) throw new BrowserVerificationRequiredError([...challengeUrls][0] ?? safeUrl);
+    throw new Error(`等待普通浏览器缓存超时（${timeoutMs}ms）。请确认专用验证窗口已关闭后重试。`);
+  } finally {
+    await stopOwnedBrowser(child);
+    await rm(cacheRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => undefined);
+  }
+}
+
+export async function renderHtmlBatchWithBrowser(urls: string[], options: FetchOptions): Promise<Map<string, string>> {
+  const uniqueUrls = [...new Set(urls)];
+  if (uniqueUrls.length === 0 || uniqueUrls.length > 5) throw new Error('普通浏览器批量读取每次只允许 1–5 个页面。');
+  if (options.browserRendering === false) throw new Error('浏览器渲染已关闭。');
+  if (!hasDesktopSession()) throw new Error('当前环境没有可用于普通浏览器缓存读取的桌面会话。');
+  const resolved = await Promise.all(uniqueUrls.map((url) => resolveSafeRemoteUrl(url, options.timeoutMs)));
+  const first = resolved[0];
+  if (!first) throw new Error('没有可供普通浏览器读取的 URL。');
+  const origin = new URL(first.url).origin;
+  if (resolved.some((item) => new URL(item.url).origin !== origin)) throw new Error('普通浏览器批量读取只允许同源页面。');
+  const executable = await findBrowserExecutable(options.browserExecutable);
+  if (!executable) throw new Error('未找到 Chrome、Edge、Chromium 或 Brave；可在 codeNovel.browserExecutable 中手动指定。');
+  if (!options.browserDataDirectory) throw new Error('浏览器隔离数据目录尚未初始化。');
+  const profile = siteProfileDirectory(options.browserDataDirectory, first.url);
+  await mkdir(profile, { recursive: true });
+  return queued(async () => {
+    options.onProgress?.(`正在启动隔离浏览器批量读取 ${resolved.length} 个页面...`);
+    const timeoutMs = Math.min(Math.max(options.browserTimeoutMs ?? options.timeoutMs, 12_000), 60_000);
+    const renderedLimit = Math.min(options.maxBytes ?? maxRenderedBytes, maxRenderedBytes);
+    try {
+      const rendered = await renderFromNormalBrowserCache(
+        executable,
+        resolved.map((item) => item.url),
+        first.address,
+        profile,
+        path.join(options.browserDataDirectory!, 'capture-cache'),
+        timeoutMs,
+        renderedLimit
+      );
+      normalBrowserPreferredUntil.set(new URL(first.url).hostname.toLowerCase(), Date.now() + normalBrowserPreferenceLifetimeMs);
+      return rendered;
+    } catch (error) {
+      if (error instanceof BrowserVerificationRequiredError && await hasRecentVerificationAttempt(profile)) {
+        throw new BrowserAutomationBlockedError(error.url);
+      }
+      throw error;
+    }
+  });
+}
+
 export async function renderHtmlWithBrowser(url: string, options: FetchOptions): Promise<string> {
   const resolved = await resolveSafeRemoteUrl(url, options.timeoutMs);
   const safeUrl = resolved.url;
@@ -126,34 +325,51 @@ export async function renderHtmlWithBrowser(url: string, options: FetchOptions):
   return queued(async () => {
     const timeoutMs = Math.min(Math.max(options.browserTimeoutMs ?? options.timeoutMs, 12_000), 60_000);
     const renderedLimit = Math.min(options.maxBytes ?? maxRenderedBytes, maxRenderedBytes);
-    const args = [
-      '--headless=new', '--disable-gpu', '--mute-audio', '--no-proxy-server', ...browserIsolationArgs,
-      hostResolverArgument(safeUrl, resolved.address), `--user-data-dir=${profile}`,
-      `--virtual-time-budget=${Math.max(timeoutMs - 2_000, 5_000)}`, '--dump-dom'
-    ];
-    args.push(safeUrl);
-    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let overflow = false;
-    child.stdout?.on('data', (chunk: Buffer) => {
-      if (overflow) return;
-      total += chunk.length;
-      if (total > renderedLimit) {
-        overflow = true;
-        child.kill();
-        return;
+    const host = new URL(safeUrl).hostname.toLowerCase();
+    const renderNormal = async (): Promise<string> => {
+      options.onProgress?.('正在启动隔离浏览器读取页面...');
+      const rendered = await renderFromNormalBrowserCache(
+        executable,
+        [safeUrl],
+        resolved.address,
+        profile,
+        path.join(options.browserDataDirectory!, 'capture-cache'),
+        timeoutMs,
+        renderedLimit
+      );
+      const html = rendered.get(safeUrl);
+      if (!html) throw new Error('普通浏览器缓存中没有找到目标页面。');
+      normalBrowserPreferredUntil.set(host, Date.now() + normalBrowserPreferenceLifetimeMs);
+      return html;
+    };
+
+    if ((normalBrowserPreferredUntil.get(host) ?? 0) > Date.now() && hasDesktopSession()) {
+      try {
+        return await renderNormal();
+      } catch (error) {
+        normalBrowserPreferredUntil.delete(host);
+        if (error instanceof BrowserVerificationRequiredError) {
+          if (await hasRecentVerificationAttempt(profile)) throw new BrowserAutomationBlockedError(safeUrl);
+          throw error;
+        }
+        // A transient normal-browser failure can still recover through headless mode.
       }
-      chunks.push(Buffer.from(chunk));
-    });
-    const { code, stderr } = await waitForExit(child, timeoutMs);
-    if (overflow) throw new Error(`浏览器渲染后的页面超过 ${Math.ceil(renderedLimit / 1_000_000)} MB，已停止读取。`);
-    const html = Buffer.concat(chunks, total).toString('utf8');
-    if (isChallengePage(html)) throw new BrowserVerificationRequiredError(safeUrl);
-    if (!html.trim() || (code !== 0 && html.length < 200)) {
-      throw new Error(`浏览器渲染失败${code === null ? '' : `（退出码 ${code}）`}${stderr ? `：${stderr.trim().slice(0, 300)}` : ''}`);
     }
-    return html;
+    options.onProgress?.('正在尝试无头浏览器读取页面...');
+    try {
+      return await renderHeadlessHtml(executable, safeUrl, resolved.address, profile, timeoutMs, renderedLimit);
+    } catch (error) {
+      if (!(error instanceof BrowserVerificationRequiredError) || !hasDesktopSession()) throw error;
+      try {
+        return await renderNormal();
+      } catch (cacheError) {
+        if (cacheError instanceof BrowserVerificationRequiredError) {
+          if (await hasRecentVerificationAttempt(profile)) throw new BrowserAutomationBlockedError(safeUrl);
+          throw error;
+        }
+        throw cacheError;
+      }
+    }
   });
 }
 
@@ -166,7 +382,7 @@ export async function startVerificationBrowser(url: string, options: FetchOption
   const profile = siteProfileDirectory(options.browserDataDirectory, safeUrl);
   await mkdir(profile, { recursive: true });
   const args = [
-    '--no-proxy-server', ...browserIsolationArgs, hostResolverArgument(safeUrl, resolved.address), `--user-data-dir=${profile}`, '--new-window'
+    '--no-proxy-server', ...browserIsolationArguments, hostResolverArgument(safeUrl, resolved.address), `--user-data-dir=${profile}`, '--new-window'
   ];
   args.push(safeUrl);
   const child = spawn(executable, args, { stdio: 'ignore', windowsHide: false, detached: true });
@@ -189,4 +405,5 @@ export async function startVerificationBrowser(url: string, options: FetchOption
     child.once('error', onError);
     child.once('exit', onExit);
   });
+  await writeFile(verificationAttemptPath(profile), new Date().toISOString(), 'utf8');
 }

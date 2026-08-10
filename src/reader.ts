@@ -4,7 +4,7 @@ import { loadChapter } from './adapters';
 import { maxLocalBookBytes, parseEpub, ParsedLocalBook, parsePlainText } from './local';
 import { Book, ChapterContent, ReadingProgress } from './model';
 import { BookRepository, SourceRepository } from './repository';
-import { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
+import { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
 
 export class ReaderDocumentProvider implements vscode.TextDocumentContentProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
@@ -30,6 +30,13 @@ export class ReaderController {
   private bossMode = false;
   private editor?: vscode.TextEditor;
   private readonly localCache = new Map<string, ParsedLocalBook>();
+  private readonly chapterLoads = new Map<string, Promise<ChapterContent>>();
+  private pendingProgress?: { bookId: string; value: ReadingProgress };
+  private progressSaveTimer?: ReturnType<typeof setTimeout>;
+  private prefetchTimer?: ReturnType<typeof setTimeout>;
+  private prefetchRevision = 0;
+  private progressWrite: Promise<void> = Promise.resolve();
+  private navigationContext?: { hasPreviousPage: boolean; hasNextPage: boolean; bossMode: boolean };
   private revealRevision = 0;
 
   constructor(
@@ -40,7 +47,21 @@ export class ReaderController {
     private readonly onError?: (error: unknown) => void | Promise<void>
   ) {}
 
-  private config() {
+  private rememberLocalBook(bookId: string, parsed: ParsedLocalBook): void {
+    this.localCache.delete(bookId);
+    this.localCache.set(bookId, parsed);
+    while (this.localCache.size > 2) {
+      const oldest = this.localCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.localCache.delete(oldest);
+    }
+  }
+
+  private reportBackgroundError(error: unknown): void {
+    if (this.onError) void Promise.resolve(this.onError(error)).catch(() => undefined);
+  }
+
+  private config(onProgress?: (message: string) => void) {
     const config = vscode.workspace.getConfiguration('codeNovel');
     const executable = config.inspect<string>('browserExecutable')?.globalValue?.trim();
     return {
@@ -52,13 +73,17 @@ export class ReaderController {
       browserRendering: config.get<boolean>('browserRendering', true),
       browserExecutable: executable || undefined,
       browserDataDirectory: path.join(this.context.globalStorageUri.fsPath, 'browser-profiles'),
-      browserTimeoutMs: config.get<number>('browserTimeout', 25000)
+      browserTimeoutMs: config.get<number>('browserTimeout', 25000),
+      prefetchNextChapter: config.get<boolean>('prefetchNextChapter', true),
+      prefetchChapterCount: config.get<number>('prefetchChapterCount', 3),
+      onProgress
     };
   }
 
   private async parseLocal(book: Book): Promise<ParsedLocalBook> {
     const cached = this.localCache.get(book.id);
     if (cached) {
+      this.rememberLocalBook(book.id, cached);
       return cached;
     }
     const uri = vscode.Uri.file(book.source);
@@ -68,7 +93,7 @@ export class ReaderController {
     const parsed = book.kind === 'epub'
       ? await parseEpub(bytes, book.source)
       : parsePlainText(bytes, book.source);
-    this.localCache.set(book.id, parsed);
+    this.rememberLocalBook(book.id, parsed);
     if (book.title !== parsed.title || book.chapters.length !== parsed.chapters.length) {
       book.title = parsed.title;
       book.chapters = parsed.chapters;
@@ -77,7 +102,12 @@ export class ReaderController {
     return parsed;
   }
 
-  private async getChapter(book: Book, index: number, force = false): Promise<ChapterContent> {
+  private async getChapter(
+    book: Book,
+    index: number,
+    force = false,
+    onProgress?: (message: string) => void
+  ): Promise<ChapterContent> {
     const reference = book.chapters[index];
     if (!reference) {
       throw new Error('章节不存在。');
@@ -90,15 +120,53 @@ export class ReaderController {
       }
       return chapter;
     }
-    if (!force) {
-      const cached = await this.repository.readCachedChapter(book.id, reference.url);
-      if (cached) {
-        return cached;
+    const loadKey = `${book.id}:${reference.url}${force ? ':force' : ''}`;
+    const inFlight = this.chapterLoads.get(loadKey);
+    if (inFlight) return inFlight;
+    const operation = (async () => {
+      if (!force) {
+        const cached = await this.repository.readCachedChapter(book.id, reference.url);
+        if (cached) {
+          return cached;
+        }
+      }
+      const chapter = await loadChapter(reference.url, this.config(onProgress), this.sources.getSource(book.sourceId));
+      await this.repository.cacheChapter(book.id, chapter);
+      return chapter;
+    })();
+    this.chapterLoads.set(loadKey, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.chapterLoads.get(loadKey) === operation) this.chapterLoads.delete(loadKey);
+    }
+  }
+
+  private scheduleChapterPrefetch(): void {
+    if (this.prefetchTimer) clearTimeout(this.prefetchTimer);
+    const revision = ++this.prefetchRevision;
+    const book = this.activeBook;
+    const config = this.config();
+    if (!book || book.kind !== 'online' || !config.prefetchNextChapter) return;
+    const indexes = chapterPrefetchIndexes(this.progress.chapterIndex, book.chapters.length, config.prefetchChapterCount);
+    if (indexes.length === 0) return;
+    this.prefetchTimer = setTimeout(() => {
+      this.prefetchTimer = undefined;
+      if (revision !== this.prefetchRevision || this.activeBook?.id !== book.id || this.bossMode) return;
+      void this.prefetchChapters(book, indexes, revision);
+    }, 200);
+  }
+
+  private async prefetchChapters(book: Book, indexes: number[], revision: number): Promise<void> {
+    for (const index of indexes) {
+      if (revision !== this.prefetchRevision || this.activeBook?.id !== book.id || this.bossMode) return;
+      try {
+        await this.getChapter(book, index);
+      } catch {
+        // Stop this window after a failure. Explicit navigation will retry and report it.
+        return;
       }
     }
-    const chapter = await loadChapter(reference.url, this.config(), this.sources.getSource(book.sourceId));
-    await this.repository.cacheChapter(book.id, chapter);
-    return chapter;
   }
 
   private async synchronizeNavigation(): Promise<void> {
@@ -107,46 +175,54 @@ export class ReaderController {
     }
     const index = this.progress.chapterIndex;
     const current = this.activeBook.chapters[index];
+    let changed = false;
     if (current && current.title !== this.chapter.title) {
       current.title = this.chapter.title;
+      changed = true;
     }
     if (this.chapter.nextUrl && index === this.activeBook.chapters.length - 1
       && !this.activeBook.chapters.some((item) => item.url === this.chapter?.nextUrl)) {
       this.activeBook.chapters.push({ title: '下一章（待加载）', url: this.chapter.nextUrl });
+      changed = true;
     }
-    await this.repository.saveBook(this.activeBook);
+    if (changed) await this.repository.saveBook(this.activeBook);
   }
 
-  async openBook(book: Book): Promise<void> {
+  async openBook(book: Book, parsedLocal?: ParsedLocalBook): Promise<void> {
+    await this.flushProgress();
+    if (this.prefetchTimer) clearTimeout(this.prefetchTimer);
+    this.prefetchRevision += 1;
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `正在打开《${book.title}》...` },
-      async () => {
+      async (progress) => {
         this.activeBook = book;
+        this.bossMode = false;
+        if (parsedLocal && book.kind !== 'online') this.rememberLocalBook(book.id, parsedLocal);
         this.progress = this.repository.getProgress(book.id);
         if (book.kind !== 'online') {
           await this.parseLocal(book);
         }
         this.progress.chapterIndex = Math.min(Math.max(this.progress.chapterIndex, 0), Math.max(book.chapters.length - 1, 0));
-        await this.loadCurrentChapter();
+        await this.loadCurrentChapter(false, (message) => progress.report({ message }));
         const document = await vscode.workspace.openTextDocument(this.provider.uri);
         await vscode.languages.setTextDocumentLanguage(document, 'typescript');
         this.editor = await vscode.window.showTextDocument(document, { preview: false });
         await vscode.commands.executeCommand('setContext', 'codeNovel.readerActive', true);
-        this.bossMode = false;
         this.render();
       }
     );
   }
 
-  private async loadCurrentChapter(force = false): Promise<void> {
+  private async loadCurrentChapter(force = false, onProgress?: (message: string) => void): Promise<void> {
     if (!this.activeBook) {
       return;
     }
-    this.chapter = await this.getChapter(this.activeBook, this.progress.chapterIndex, force);
+    this.chapter = await this.getChapter(this.activeBook, this.progress.chapterIndex, force, onProgress);
     await this.synchronizeNavigation();
     this.pages = paginate(this.chapter.content, this.config().pageCharacters);
     this.progress.pageIndex = Math.min(Math.max(this.progress.pageIndex, 0), this.pages.length - 1);
     await this.persistProgress();
+    this.scheduleChapterPrefetch();
   }
 
   private render(): void {
@@ -176,9 +252,17 @@ export class ReaderController {
     const state = this.activeBook && this.chapter && !this.bossMode
       ? pageNavigationState(this.progress.pageIndex, this.pages.length)
       : { hasPreviousPage: false, hasNextPage: false };
-    void vscode.commands.executeCommand('setContext', 'codeNovel.hasPreviousPage', state.hasPreviousPage);
-    void vscode.commands.executeCommand('setContext', 'codeNovel.hasNextPage', state.hasNextPage);
-    void vscode.commands.executeCommand('setContext', 'codeNovel.bossMode', this.bossMode);
+    const next = { ...state, bossMode: this.bossMode };
+    if (this.navigationContext?.hasPreviousPage !== next.hasPreviousPage) {
+      void vscode.commands.executeCommand('setContext', 'codeNovel.hasPreviousPage', next.hasPreviousPage);
+    }
+    if (this.navigationContext?.hasNextPage !== next.hasNextPage) {
+      void vscode.commands.executeCommand('setContext', 'codeNovel.hasNextPage', next.hasNextPage);
+    }
+    if (this.navigationContext?.bossMode !== next.bossMode) {
+      void vscode.commands.executeCommand('setContext', 'codeNovel.bossMode', next.bossMode);
+    }
+    this.navigationContext = next;
   }
 
   private async revealReadingArea(expectedContent: string): Promise<void> {
@@ -209,14 +293,51 @@ export class ReaderController {
       return;
     }
     this.progress.updatedAt = Date.now();
-    await this.repository.saveProgress(this.activeBook.id, { ...this.progress });
+    this.pendingProgress = { bookId: this.activeBook.id, value: { ...this.progress } };
+    await this.flushProgress();
+  }
+
+  private scheduleProgressPersistence(): void {
+    if (!this.activeBook) return;
+    this.progress.updatedAt = Date.now();
+    this.pendingProgress = { bookId: this.activeBook.id, value: { ...this.progress } };
+    if (this.progressSaveTimer) clearTimeout(this.progressSaveTimer);
+    this.progressSaveTimer = setTimeout(() => {
+      this.progressSaveTimer = undefined;
+      void this.flushProgress().catch((error) => this.reportBackgroundError(error));
+    }, 400);
+  }
+
+  async flushProgress(): Promise<void> {
+    if (this.progressSaveTimer) {
+      clearTimeout(this.progressSaveTimer);
+      this.progressSaveTimer = undefined;
+    }
+    const pending = this.pendingProgress;
+    this.pendingProgress = undefined;
+    if (!pending) {
+      await this.progressWrite;
+      return;
+    }
+    const operation = this.progressWrite
+      .catch(() => undefined)
+      .then(() => this.repository.saveProgress(pending.bookId, pending.value));
+    this.progressWrite = operation.catch(() => undefined);
+    await operation;
+  }
+
+  async dispose(): Promise<void> {
+    if (this.prefetchTimer) clearTimeout(this.prefetchTimer);
+    this.prefetchTimer = undefined;
+    this.prefetchRevision += 1;
+    await this.flushProgress();
   }
 
   async nextPage(): Promise<void> {
     if (!this.activeBook || this.bossMode) return;
     if (this.progress.pageIndex < this.pages.length - 1) {
       this.progress.pageIndex += 1;
-      await this.persistProgress();
+      this.scheduleProgressPersistence();
       this.render();
     } else {
       await this.nextChapter();
@@ -227,7 +348,7 @@ export class ReaderController {
     if (!this.activeBook || this.bossMode) return;
     if (this.progress.pageIndex > 0) {
       this.progress.pageIndex -= 1;
-      await this.persistProgress();
+      this.scheduleProgressPersistence();
       this.render();
     } else if (this.progress.chapterIndex > 0) {
       await this.previousChapter(true);
@@ -266,7 +387,7 @@ export class ReaderController {
     try {
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Window, title: '正在加载章节...' },
-        () => this.loadCurrentChapter()
+        (progress) => this.loadCurrentChapter(false, (message) => progress.report({ message }))
       );
       if (openLastPage) {
         this.progress.pageIndex = this.pages.length - 1;
@@ -297,6 +418,7 @@ export class ReaderController {
   }
 
   async openBookAtChapter(book: Book, chapterIndex: number): Promise<void> {
+    await this.flushProgress();
     await this.repository.saveProgress(book.id, {
       chapterIndex: Math.min(Math.max(chapterIndex, 0), Math.max(book.chapters.length - 1, 0)),
       pageIndex: 0,
@@ -307,6 +429,13 @@ export class ReaderController {
 
   toggleBoss(): void {
     this.bossMode = !this.bossMode;
+    if (this.bossMode) {
+      if (this.prefetchTimer) clearTimeout(this.prefetchTimer);
+      this.prefetchTimer = undefined;
+      this.prefetchRevision += 1;
+    } else {
+      this.scheduleChapterPrefetch();
+    }
     this.render();
   }
 

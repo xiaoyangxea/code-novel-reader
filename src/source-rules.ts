@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import * as cheerio from 'cheerio';
+import * as cheerio from 'cheerio/slim';
 import type { CheerioAPI, Cheerio } from 'cheerio';
 import type { AnyNode } from 'domhandler';
 import { loadCatalog, loadChapter, parseCatalogHtml, parseChapterHtml } from './adapters';

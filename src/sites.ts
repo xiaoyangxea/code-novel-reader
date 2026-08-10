@@ -45,6 +45,7 @@ export const siteProfiles: SiteProfile[] = [
     bookTitleSelectors: ['h1:not(.logo)', 'title'],
     authorSelectors: ['p'],
     largestCatalogContainer: true,
+    catalogPageSelectors: ['select option[value*="/book/"]'],
     catalogPageUrlPattern: /\/book\/\d+(?:_\d+)?\/?$/i,
     maxCatalogPages: 100,
     catalogDelayMs: 150,

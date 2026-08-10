@@ -11,6 +11,30 @@ const {
 
 const { normalizeNovelSource, parseSourceSearchHtml } = core;
 const { assertSafeRemoteUrl, isBlockedNetworkAddress, readBodyLimited } = core;
+const { isBrowserChallengeHtml } = core;
+const { browserIsolationArguments } = core;
+const { chapterPrefetchIndexes } = core;
+
+test('keeps a bounded sliding window of chapters ahead of the reader', () => {
+  assert.deepEqual(chapterPrefetchIndexes(9, 100, 3), [10, 11, 12]);
+  assert.deepEqual(chapterPrefetchIndexes(10, 100, 3), [11, 12, 13]);
+  assert.deepEqual(chapterPrefetchIndexes(98, 100, 3), [99]);
+  assert.deepEqual(chapterPrefetchIndexes(9, 100, 0), []);
+  assert.equal(chapterPrefetchIndexes(0, 100, 99).length, 10);
+});
+
+test('suppresses browser-owned translate and crash restore prompts', () => {
+  assert.equal(browserIsolationArguments.includes('--disable-translate'), true);
+  assert.equal(browserIsolationArguments.includes('--disable-features=TranslateUI'), true);
+  assert.equal(browserIsolationArguments.includes('--hide-crash-restore-bubble'), true);
+  assert.equal(browserIsolationArguments.includes('--disable-session-crashed-bubble'), true);
+});
+
+test('distinguishes real browser challenges from readable novel pages', () => {
+  assert.equal(isBrowserChallengeHtml('<html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/a.js"></script></html>'), true);
+  assert.equal(isBrowserChallengeHtml(`<html><title>第十章</title><body><div id="content">${'正文内容。'.repeat(500)}</div><script src="/cdn-cgi/challenge-platform/a.js"></script></body></html>`), false);
+  assert.equal(isBrowserChallengeHtml(`<html><title>第十章</title><body><div id="content">${'主角看到了验证码。'.repeat(300)}</div></body></html>`), false);
+});
 
 test('switches editor navigation between pages and chapters at page boundaries', () => {
   assert.deepEqual(pageNavigationState(0, 3), { hasPreviousPage: false, hasNextPage: true });
@@ -190,12 +214,22 @@ test('selects the largest Qidiy catalog and discovers only same-book pages', () 
       <li><a href="/book/112510/2.html">第2章 继续</a></li>
       <li><a href="/book/112510/3.html">第3章 后续</a></li>
     </ul>
+    <select>
+      <option value="/book/112510/">1</option>
+      <option value="/book/112510_2/">2</option>
+      <option value="/book/112510_20/">20</option>
+      <option value="/book/112510_21/">21</option>
+    </select>
     <a href="/book/112510_21/">下一页</a>
     <a href="/book/999999_2/">其他小说</a>`;
   const url = 'https://www.qidiy.com/book/112510_20/';
   const parsed = parseCatalogHtml(html, url);
   assert.deepEqual(parsed.chapters.map((chapter) => chapter.title), ['第1章 开始', '第2章 继续', '第3章 后续']);
-  assert.deepEqual(catalogPageUrls(html, url), ['https://www.qidiy.com/book/112510_21/']);
+  assert.deepEqual(catalogPageUrls(html, url), [
+    'https://www.qidiy.com/book/112510/',
+    'https://www.qidiy.com/book/112510_2/',
+    'https://www.qidiy.com/book/112510_21/'
+  ]);
 });
 
 test('discovers paged catalogs for mobile and static sites', () => {

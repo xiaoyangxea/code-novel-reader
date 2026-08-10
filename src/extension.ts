@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { likelyCatalogUrl, loadCatalog, loadChapter, searchBooks } from './adapters';
+import { likelyCatalogUrl, loadCatalog, loadCatalogPreview, loadChapter, searchBooks } from './adapters';
 import { BrowserVerificationRequiredError, startVerificationBrowser } from './browser';
 import { discoverBooks, hasDiscoveryKey } from './discovery';
 import { LibraryProvider, BookItem } from './library';
@@ -12,7 +12,9 @@ import { manageSources } from './source-manager';
 import { assertHttpUrl, searchNovelSources } from './source-rules';
 import { siteProfiles } from './sites';
 
-function requestOptions(context: vscode.ExtensionContext) {
+let activeReaderController: ReaderController | undefined;
+
+function requestOptions(context: vscode.ExtensionContext, onProgress?: (message: string) => void) {
   const config = vscode.workspace.getConfiguration('codeNovel');
   const executable = config.inspect<string>('browserExecutable')?.globalValue?.trim();
   return {
@@ -22,15 +24,21 @@ function requestOptions(context: vscode.ExtensionContext) {
     browserRendering: config.get<boolean>('browserRendering', true),
     browserExecutable: executable || undefined,
     browserDataDirectory: path.join(context.globalStorageUri.fsPath, 'browser-profiles'),
-    browserTimeoutMs: config.get<number>('browserTimeout', 25000)
+    browserTimeoutMs: config.get<number>('browserTimeout', 25000),
+    onProgress
   };
 }
 
-async function catalogFromUrl(context: vscode.ExtensionContext, url: string, source?: NovelSource): Promise<{ catalog: ParsedCatalog; selectedIndex: number }> {
+async function catalogFromUrl(
+  context: vscode.ExtensionContext,
+  url: string,
+  source?: NovelSource,
+  onProgress?: (message: string) => void
+): Promise<{ catalog: ParsedCatalog; selectedIndex: number }> {
   const inferredCatalogUrl = likelyCatalogUrl(url);
   for (const candidate of [...new Set([inferredCatalogUrl, url].filter((value): value is string => Boolean(value)))]) {
     try {
-      const directCatalog = await loadCatalog(candidate, requestOptions(context), source);
+      const directCatalog = await loadCatalog(candidate, requestOptions(context, onProgress), source);
       if (directCatalog.chapters.length >= 2) {
         return {
           catalog: directCatalog,
@@ -42,11 +50,11 @@ async function catalogFromUrl(context: vscode.ExtensionContext, url: string, sou
     }
   }
 
-  const chapter = await loadChapter(url, requestOptions(context), source);
+  const chapter = await loadChapter(url, requestOptions(context, onProgress), source);
   const candidates = [chapter.catalogUrl, inferredCatalogUrl].filter((value): value is string => Boolean(value));
   for (const candidate of [...new Set(candidates)]) {
     try {
-      const catalog = await loadCatalog(candidate, requestOptions(context), source);
+      const catalog = await loadCatalog(candidate, requestOptions(context, onProgress), source);
       if (catalog.chapters.length >= 2) {
         const selectedIndex = Math.max(0, catalog.chapters.findIndex((item) => item.url === url));
         return { catalog, selectedIndex };
@@ -86,9 +94,9 @@ async function importOnlineUrl(
   }
   const imported = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: '正在识别小说目录和章节...' },
-    async () => {
+    async (progress) => {
       const source = sources.getSource(sourceId) ?? sources.findForUrl(url);
-      const { catalog, selectedIndex } = await catalogFromUrl(context, url, source);
+      const { catalog, selectedIndex } = await catalogFromUrl(context, url, source, (message) => progress.report({ message }));
       const book: Book = {
         id: stableId('online', catalog.chapters[0]?.url ? likelyCatalogUrl(catalog.chapters[0].url) ?? url : url),
         title: catalog.title,
@@ -151,7 +159,7 @@ async function refreshCatalog(context: vscode.ExtensionContext, repository: Book
   const source = sources.getSource(book.sourceId) ?? sources.findForUrl(book.source);
   const refreshed = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `正在刷新《${book.title}》目录...` },
-    () => catalogFromUrl(context, book.source, source)
+    (progress) => catalogFromUrl(context, book.source, source, (message) => progress.report({ message }))
   );
   book.title = refreshed.catalog.title;
   book.author = refreshed.catalog.author;
@@ -175,9 +183,9 @@ async function probeDiscoveryResults(context: vscode.ExtensionContext, results: 
       const inferred = likelyCatalogUrl(result.url);
       for (const candidate of [...new Set([inferred, result.url].filter((value): value is string => Boolean(value)))]) {
         try {
-          const catalog = await loadCatalog(candidate, requestOptions(context));
+          const catalog = await loadCatalogPreview(candidate, requestOptions(context));
           if (catalog.chapters.length >= 2) {
-            return { ...result, title: catalog.title || result.title, chapterCount: catalog.chapters.length };
+            return { ...result, title: catalog.title || result.title };
           }
         } catch {
           // Keep the discovery result as an unverified URL.
@@ -257,7 +265,7 @@ async function importLocal(repository: BookRepository, reader: ReaderController)
         addedAt: Date.now()
       };
       await repository.saveBook(book);
-      await reader.openBook(book);
+      await reader.openBook(book, parsed);
     }
   );
 }
@@ -351,7 +359,7 @@ async function showError(context: vscode.ExtensionContext, error: unknown): Prom
     if (action !== '打开专用验证窗口') return;
     await startVerificationBrowser(error.url, requestOptions(context));
     vscode.window.showInformationMessage(
-      '专用验证窗口已打开。请在其中完成验证后手动关闭窗口，再重新执行刚才的导入或阅读操作；扩展不会自动结束该浏览器进程。'
+      '专用验证窗口已打开。请在其中完成验证或确认页面可以正常显示，然后手动关闭窗口并重试。若站点仍拒绝插件读取，将直接说明，不会再次循环要求验证。'
     );
     return;
   }
@@ -368,6 +376,7 @@ export function activate(context: vscode.ExtensionContext): void {
     });
   };
   const reader = new ReaderController(repository, documentProvider, sources, context, handleError);
+  activeReaderController = reader;
   const library = new LibraryProvider(repository, () => sources.getSources().length);
   context.subscriptions.push(sources.onDidChange(() => library.refresh()));
 
@@ -419,4 +428,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+  await activeReaderController?.dispose();
+  activeReaderController = undefined;
+}
