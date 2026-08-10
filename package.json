@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -81,6 +81,10 @@
         "command": "codeNovel.manageSources",
         "title": "代码小说: 书源管理",
         "icon": "$(server-environment)"
+      },
+      {
+        "command": "codeNovel.clearBrowserData",
+        "title": "代码小说: 清除专用浏览器数据"
       },
       {
         "command": "codeNovel.refreshLibrary",
@@ -280,6 +284,24 @@
           "type": "string",
           "default": "",
           "description": "可选 HTTP/HTTPS 代理，例如 http://127.0.0.1:7890。留空时读取 VS Code http.proxy 和环境变量。"
+        },
+        "codeNovel.browserRendering": {
+          "type": "boolean",
+          "default": true,
+          "description": "普通抓取无法识别页面时，使用本机 Chrome/Edge/Chromium/Brave 的隔离配置进行渲染。"
+        },
+        "codeNovel.browserExecutable": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "可选浏览器可执行文件路径。留空时自动查找；出于安全考虑，仅接受用户全局设置，不读取工作区值。"
+        },
+        "codeNovel.browserTimeout": {
+          "type": "number",
+          "default": 25000,
+          "minimum": 10000,
+          "maximum": 60000,
+          "description": "浏览器渲染网页的超时时间（毫秒）。"
         },
         "codeNovel.searchProviders": {
           "type": "array",

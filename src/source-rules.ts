@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
 import type { CheerioAPI, Cheerio } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import { loadCatalog, loadChapter, parseCatalogHtml } from './adapters';
+import { loadCatalog, loadChapter, parseCatalogHtml, parseChapterHtml } from './adapters';
+import { BrowserVerificationRequiredError, renderHtmlWithBrowser } from './browser';
 import { NovelSource, ParsedCatalog, SearchResult } from './model';
 import { assertSafeRemoteUrl, FetchOptions, fetchHtml, resolveUrl } from './net';
 import { sourceAllowsUrl } from './source-policy';
@@ -151,6 +152,32 @@ export function parseSourceSearchHtml(html: string, baseUrl: string, source: Nov
   return results.filter((item, index) => results.findIndex((other) => other.url === item.url) === index);
 }
 
+async function sourcePageHtml(
+  url: string,
+  options: FetchOptions,
+  validate: (html: string) => void,
+  referer?: string
+): Promise<string> {
+  let staticError: unknown;
+  const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000), referer };
+  try {
+    const html = await fetchHtml(url, limited);
+    validate(html);
+    return html;
+  } catch (error) {
+    staticError = error;
+  }
+  if (options.browserRendering === false) throw staticError;
+  try {
+    const html = await renderHtmlWithBrowser(url, limited);
+    validate(html);
+    return html;
+  } catch (error) {
+    if (error instanceof BrowserVerificationRequiredError) throw error;
+    throw new Error(`普通抓取失败：${staticError instanceof Error ? staticError.message : String(staticError)}；浏览器渲染也失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export async function searchNovelSources(
   keyword: string,
   sources: NovelSource[],
@@ -159,18 +186,26 @@ export async function searchNovelSources(
   const errors: string[] = [];
   const enabled = sources.filter((source) => source.enabled && source.search).slice(0, 50);
   const results: SearchResult[] = [];
+  let verificationError: BrowserVerificationRequiredError | undefined;
   for (let offset = 0; offset < enabled.length; offset += 5) {
     const batch = await Promise.all(enabled.slice(offset, offset + 5).map(async (source) => {
       const url = source.search!.url.replace(/\{\{?keyword\}?\}/g, encodeURIComponent(keyword));
       try {
-        return parseSourceSearchHtml(await fetchHtml(url, options), url, source);
+        let parsed: SearchResult[] = [];
+        const html = await sourcePageHtml(url, options, (value) => {
+          parsed = parseSourceSearchHtml(value, url, source);
+          if (parsed.length === 0) throw new Error('搜索页没有匹配书源规则。');
+        });
+        return parsed.length ? parsed : parseSourceSearchHtml(html, url, source);
       } catch (error) {
+        if (error instanceof BrowserVerificationRequiredError) verificationError ??= error;
         errors.push(`${source.name}: ${error instanceof Error ? error.message : String(error)}`);
         return [];
       }
     }));
     results.push(...batch.flat());
   }
+  if (results.length === 0 && enabled.length === 1 && verificationError) throw verificationError;
   return { results, errors };
 }
 
@@ -226,11 +261,16 @@ export async function generateNovelSource(catalogUrl: string, options: FetchOpti
   catalog: ParsedCatalog;
 }> {
   const safeUrl = assertHttpUrl(catalogUrl, '目录 URL');
-  const catalogHtml = await fetchHtml(safeUrl, options);
-  const catalog = parseCatalogHtml(catalogHtml, safeUrl);
-  if (catalog.chapters.length < 2) throw new Error('没有识别到完整目录，无法生成书源。');
+  let catalog: ParsedCatalog | undefined;
+  const catalogHtml = await sourcePageHtml(safeUrl, options, (html) => {
+    catalog = parseCatalogHtml(html, safeUrl);
+    if (catalog.chapters.length < 2) throw new Error('没有识别到完整目录，无法生成书源。');
+  });
+  if (!catalog || catalog.chapters.length < 2) throw new Error('没有识别到完整目录，无法生成书源。');
   const firstChapter = catalog.chapters[0]!;
-  const chapterHtml = await fetchHtml(firstChapter.url, { ...options, referer: safeUrl });
+  const chapterHtml = await sourcePageHtml(firstChapter.url, options, (html) => {
+    parseChapterHtml(html, firstChapter.url);
+  }, safeUrl);
   const catalogPage = cheerio.load(catalogHtml);
   const chapterPage = cheerio.load(chapterHtml);
   const hostname = new URL(safeUrl).hostname;

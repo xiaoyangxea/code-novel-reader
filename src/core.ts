@@ -1,13 +1,17 @@
 export {
   parseCatalogHtml,
+  catalogPageUrls,
+  chapterPageState,
   parseChapterHtml,
   likelyCatalogUrl,
   parseMediaWikiSearch,
   parseSearchHtml,
   parseZonghengSearch,
-  searchBooks
+  searchBooks,
+  loadCatalog,
+  loadChapter
 } from './adapters';
 export { parseEpub, parsePlainText, validateEpubArchive } from './local';
-export { assertSafeRemoteUrl, fetchHtml, isBlockedNetworkAddress, readBodyLimited } from './net';
+export { assertSafeRemoteUrl, resolveSafeRemoteUrl, fetchHtml, isBlockedNetworkAddress, readBodyLimited } from './net';
 export { pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
 export { normalizeNovelSource, parseSourceSearchHtml } from './source-rules';

@@ -6,7 +6,7 @@ import core from '../dist/core.js';
 
 const {
   parseCatalogHtml, parseChapterHtml, parseEpub, parsePlainText, paginate, renderBoss,
-  likelyCatalogUrl, pageNavigationState, parseMediaWikiSearch, parseZonghengSearch
+  likelyCatalogUrl, catalogPageUrls, chapterPageState, pageNavigationState, parseMediaWikiSearch, parseZonghengSearch
 } = core;
 
 const { normalizeNovelSource, parseSourceSearchHtml } = core;
@@ -164,7 +164,94 @@ test('uses explicit selectors for additional novel sites', () => {
   }
 });
 
+test('parses newly supported public novel layouts', () => {
+  const body = '这是公开章节的测试正文，用于验证不同网站结构下的内容提取结果。'.repeat(10);
+  const fixtures = [
+    ['https://www.qidiy.com/book/112510/123.html', `<h1 class="title">第一章</h1><div id="content">${body}</div>`],
+    ['https://m.kudushu.org/html/1078405/12345/', `<h1 class="nr_title">第二章</h1><div id="novelcontent">${body}</div>`],
+    ['https://www.sudugu.org/175/16778.html', `<div class="submenu"><h1>第三章</h1></div><div class="con">${body}</div>`],
+    ['https://xszj.org/b/362604/c/123', `<article><h1>第四章</h1></article><div id="booktxt">${body}</div>`],
+    ['https://cn.ttkan.co/novel/pagea/test_1.html', `<div class="title"><h1>第五章</h1></div><div class="content">${body}</div>`],
+    ['https://www.shuhaige.net/431594/1.html', `<div class="bookname"><h1>第六章</h1></div><div id="content">${body}</div>`],
+    ['https://m.biquge365.net/shu/563052/1.html', `<div id="neirong"><h1>第七章</h1><div id="txt">${body}</div></div>`]
+  ];
+  for (const [url, html] of fixtures) {
+    const parsed = parseChapterHtml(html, url);
+    assert.ok(parsed.content.length > 120, url);
+  }
+});
+
+test('selects the largest Qidiy catalog and discovers only same-book pages', () => {
+  const html = `
+    <h1>目录测试</h1>
+    <ul class="section-list"><li><a href="/book/112510/900.html">第900章 最新</a></li></ul>
+    <ul class="section-list">
+      <li><a href="/book/112510/1.html">第1章 开始</a></li>
+      <li><a href="/book/112510/2.html">第2章 继续</a></li>
+      <li><a href="/book/112510/3.html">第3章 后续</a></li>
+    </ul>
+    <a href="/book/112510_21/">下一页</a>
+    <a href="/book/999999_2/">其他小说</a>`;
+  const url = 'https://www.qidiy.com/book/112510_20/';
+  const parsed = parseCatalogHtml(html, url);
+  assert.deepEqual(parsed.chapters.map((chapter) => chapter.title), ['第1章 开始', '第2章 继续', '第3章 后续']);
+  assert.deepEqual(catalogPageUrls(html, url), ['https://www.qidiy.com/book/112510_21/']);
+});
+
+test('discovers paged catalogs for mobile and static sites', () => {
+  assert.deepEqual(catalogPageUrls(
+    '<select name="pageselect"><option value="/html/1078405/asc-1/">1</option><option value="/html/1078405/asc-2/">2</option></select>',
+    'https://m.kudushu.org/book/1078405/'
+  ), [
+    'https://m.kudushu.org/html/1078405/asc-1/',
+    'https://m.kudushu.org/html/1078405/asc-2/'
+  ]);
+  assert.deepEqual(catalogPageUrls(
+    '<a class="gr" href="p-2.html#dir">下一页</a>',
+    'https://www.sudugu.org/175/'
+  ), ['https://www.sudugu.org/175/p-2.html']);
+  assert.deepEqual(catalogPageUrls(
+    '<select id="indexselect"><option value="/b/362604/cs/1">1</option><option value="/b/362604/cs/2">2</option></select>',
+    'https://xszj.org/b/362604/cs/1'
+  ), ['https://xszj.org/b/362604/cs/2']);
+});
+
+test('does not expose a remote chapter page as next chapter', () => {
+  const body = '这是分页章节的第一段正文。'.repeat(20);
+  const parsed = parseChapterHtml(`
+    <h1 class="title">第10章 测试（第1/2页）</h1>
+    <div id="content">${body}<p>（本章未完，请点击下一页继续阅读）</p></div>
+    <a href="10/2.html">下一页</a><a href="11.html">下一章</a>
+  `, 'https://www.qidiy.com/book/123/10.html');
+  assert.equal(parsed.title, '第10章 测试');
+  assert.equal(parsed.nextUrl, 'https://www.qidiy.com/book/123/11.html');
+  assert.doesNotMatch(parsed.content, /本章未完/);
+});
+
+test('infers missing remote chapter page links from page counters', () => {
+  assert.deepEqual(chapterPageState(
+    '<h1 class="title">第10章 测试（第1/3页）</h1>',
+    'https://www.qidiy.com/book/123/10.html'
+  ), {
+    current: 1,
+    total: 3,
+    nextPageUrl: 'https://www.qidiy.com/book/123/10/2.html'
+  });
+  assert.equal(chapterPageState(
+    '<h1>第10章 测试（第2/3页）</h1>',
+    'https://m.kudushu.org/html/1078405/12345_2/'
+  ).nextPageUrl, 'https://m.kudushu.org/html/1078405/12345_3/');
+});
+
 test('infers site-specific catalog URLs', () => {
+  assert.equal(
+    likelyCatalogUrl('https://www.qidiy.com/book/112510/123.html'),
+    'https://www.qidiy.com/book/112510/'
+  );
+  assert.equal(
+    likelyCatalogUrl('https://m.kudushu.org/html/1078405/12345_2/'),
+    'https://m.kudushu.org/book/1078405/'
+  );
   assert.equal(
     likelyCatalogUrl('https://chapter.zongheng.com/chapter/123/456.html'),
     'https://book.zongheng.com/showchapter/123.html'

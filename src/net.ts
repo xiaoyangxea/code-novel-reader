@@ -22,6 +22,10 @@ export interface FetchOptions {
   referer?: string;
   proxy?: string;
   maxBytes?: number;
+  browserRendering?: boolean;
+  browserExecutable?: string;
+  browserDataDirectory?: string;
+  browserTimeoutMs?: number;
 }
 
 interface DownloadedResponse {
@@ -32,6 +36,12 @@ interface DownloadedResponse {
 
 export function assertSafeRemoteUrl(rawUrl: string): string {
   return validateRemoteTarget(rawUrl).toString();
+}
+
+export async function resolveSafeRemoteUrl(rawUrl: string, timeoutMs: number): Promise<{ url: string; address: string }> {
+  const target = validateRemoteTarget(rawUrl);
+  const address = await resolvePublicAddress(target, timeoutMs);
+  return { url: target.toString(), address };
 }
 
 function validateRemoteTarget(rawUrl: string): URL {

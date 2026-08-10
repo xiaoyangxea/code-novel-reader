@@ -35,17 +35,24 @@ export class ReaderController {
   constructor(
     private readonly repository: BookRepository,
     private readonly provider: ReaderDocumentProvider,
-    private readonly sources: SourceRepository
+    private readonly sources: SourceRepository,
+    private readonly context: vscode.ExtensionContext,
+    private readonly onError?: (error: unknown) => void | Promise<void>
   ) {}
 
   private config() {
     const config = vscode.workspace.getConfiguration('codeNovel');
+    const executable = config.inspect<string>('browserExecutable')?.globalValue?.trim();
     return {
       pageCharacters: config.get<number>('pageCharacters', 1400),
       commentWidth: config.get<number>('commentWidth', 72),
       timeoutMs: config.get<number>('requestTimeout', 15000),
       userAgent: config.get<string>('userAgent', 'Mozilla/5.0'),
-      proxy: config.get<string>('proxy') || vscode.workspace.getConfiguration('http').get<string>('proxy') || undefined
+      proxy: config.get<string>('proxy') || vscode.workspace.getConfiguration('http').get<string>('proxy') || undefined,
+      browserRendering: config.get<boolean>('browserRendering', true),
+      browserExecutable: executable || undefined,
+      browserDataDirectory: path.join(this.context.globalStorageUri.fsPath, 'browser-profiles'),
+      browserTimeoutMs: config.get<number>('browserTimeout', 25000)
     };
   }
 
@@ -267,7 +274,11 @@ export class ReaderController {
       }
       this.render();
     } catch (error) {
-      vscode.window.showErrorMessage(`章节加载失败：${error instanceof Error ? error.message : String(error)}`);
+      if (this.onError) {
+        await this.onError(error);
+      } else {
+        vscode.window.showErrorMessage(`章节加载失败：${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
 
