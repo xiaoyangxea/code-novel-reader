@@ -349,17 +349,10 @@ async function showError(context: vscode.ExtensionContext, error: unknown): Prom
       '打开专用验证窗口'
     );
     if (action !== '打开专用验证窗口') return;
-    const session = await startVerificationBrowser(error.url, requestOptions(context));
-    try {
-      await vscode.window.showInformationMessage(
-        '请在专用窗口完成站点验证并关闭该窗口，然后点击“验证完成”。扩展不会绕过验证码、登录或付费限制。',
-        { modal: true },
-        '验证完成'
-      );
-    } finally {
-      session.close();
-    }
-    vscode.window.showInformationMessage('验证数据已保存在插件隔离目录中，请重新执行刚才的导入或阅读操作。');
+    await startVerificationBrowser(error.url, requestOptions(context));
+    vscode.window.showInformationMessage(
+      '专用验证窗口已打开。请在其中完成验证后手动关闭窗口，再重新执行刚才的导入或阅读操作；扩展不会自动结束该浏览器进程。'
+    );
     return;
   }
   vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));

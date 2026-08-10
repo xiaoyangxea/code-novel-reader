@@ -157,7 +157,7 @@ export async function renderHtmlWithBrowser(url: string, options: FetchOptions):
   });
 }
 
-export async function startVerificationBrowser(url: string, options: FetchOptions): Promise<{ close(): void }> {
+export async function startVerificationBrowser(url: string, options: FetchOptions): Promise<void> {
   const resolved = await resolveSafeRemoteUrl(url, options.timeoutMs);
   const safeUrl = resolved.url;
   const executable = await findBrowserExecutable(options.browserExecutable);
@@ -169,13 +169,24 @@ export async function startVerificationBrowser(url: string, options: FetchOption
     '--no-proxy-server', ...browserIsolationArgs, hostResolverArgument(safeUrl, resolved.address), `--user-data-dir=${profile}`, '--new-window'
   ];
   args.push(safeUrl);
-  const child = spawn(executable, args, { stdio: 'ignore', windowsHide: false });
+  const child = spawn(executable, args, { stdio: 'ignore', windowsHide: false, detached: true });
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, 800);
-    child.once('error', (error) => {
+    const timer = setTimeout(() => {
+      child.removeListener('error', onError);
+      child.removeListener('exit', onExit);
+      child.unref();
+      resolve();
+    }, 1200);
+    const onError = (error: Error) => {
       clearTimeout(timer);
       reject(error);
-    });
+    };
+    const onExit = (code: number | null) => {
+      if (code === 0) return;
+      clearTimeout(timer);
+      reject(new Error(`专用浏览器启动后立即退出${code === null ? '' : `（退出码 ${code}）`}。`));
+    };
+    child.once('error', onError);
+    child.once('exit', onExit);
   });
-  return { close: () => { if (!child.killed) child.kill(); } };
 }
