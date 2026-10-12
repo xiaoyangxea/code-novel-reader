@@ -1,8 +1,9 @@
 import * as iconv from 'iconv-lite';
 import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
-import { Agent, Dispatcher, fetch as undiciFetch, ProxyAgent } from 'undici';
+import { Agent, Dispatcher, fetch as undiciFetch, Pool, ProxyAgent } from 'undici';
 import type { SearchResult } from './model';
+import { effectiveProxy } from './proxy';
 
 const maxResponseBytes = 8_000_000;
 const blockedAddresses = new BlockList();
@@ -13,7 +14,7 @@ for (const [network, prefix] of [
   ['224.0.0.0', 4], ['240.0.0.0', 4]
 ] as const) blockedAddresses.addSubnet(network, prefix, 'ipv4');
 for (const [network, prefix] of [
-  ['::', 128], ['::1', 128], ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32],
+  ['::', 128], ['::1', 128], ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32], ['2001:2::', 48],
   ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]
 ] as const) blockedAddresses.addSubnet(network, prefix, 'ipv6');
 
@@ -58,9 +59,9 @@ export function assertSafeRemoteUrl(rawUrl: string): string {
   return validateRemoteTarget(rawUrl).toString();
 }
 
-export async function resolveSafeRemoteUrl(rawUrl: string, timeoutMs: number): Promise<{ url: string; address: string }> {
+export async function resolveSafeRemoteUrl(rawUrl: string, timeoutMs: number, proxy?: string): Promise<{ url: string; address: string }> {
   const target = validateRemoteTarget(rawUrl);
-  const address = await resolvePublicAddress(target, timeoutMs);
+  const address = await resolvePublicAddress(target, timeoutMs, effectiveProxy(proxy));
   return { url: target.toString(), address };
 }
 
@@ -106,7 +107,7 @@ function normalizeCharset(value: string): string {
 }
 
 function isFakeIp(address: string): boolean {
-  return /^198\.(?:18|19)\./.test(address) || /^fdfe:dcba:9876:/i.test(address);
+  return /^198\.(?:18|19)\./.test(address) || /^fdfe:dcba:9876:/i.test(address) || /^2001:2:/i.test(address);
 }
 
 export function isBlockedNetworkAddress(address: string): boolean {
@@ -117,7 +118,7 @@ export function isBlockedNetworkAddress(address: string): boolean {
     : family === 6 && blockedAddresses.check(normalized, 'ipv6');
 }
 
-async function resolveWithDoh(hostname: string, timeoutMs: number): Promise<string | undefined> {
+async function resolveWithDoh(hostname: string, timeoutMs: number, proxy?: string): Promise<string | undefined> {
   const endpoints = [
     `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
     `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`
@@ -125,10 +126,12 @@ async function resolveWithDoh(hostname: string, timeoutMs: number): Promise<stri
   for (const endpoint of endpoints) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 5000));
+    const dispatcher = proxy ? new ProxyAgent(proxy) : undefined;
     try {
       const response = await undiciFetch(endpoint, {
         redirect: 'error',
         signal: controller.signal,
+        dispatcher,
         headers: { Accept: 'application/dns-json' }
       });
       if (!response.ok) {
@@ -138,12 +141,15 @@ async function resolveWithDoh(hostname: string, timeoutMs: number): Promise<stri
       const data = JSON.parse((await readBodyLimited(response, 100_000, 'DNS 响应')).toString('utf8')) as {
         Answer?: Array<{ type?: number; data?: string }>;
       };
-      const address = data.Answer?.find((answer) => answer.type === 1 && answer.data && isIP(answer.data) === 4)?.data;
+      const addresses = data.Answer?.flatMap((answer) => answer.type === 1 && answer.data && isIP(answer.data) === 4 ? [answer.data] : []) ?? [];
+      if (addresses.some(isBlockedNetworkAddress)) continue;
+      const address = addresses[0];
       if (address) return address;
     } catch {
       // Try the next resolver.
     } finally {
       clearTimeout(timer);
+      await dispatcher?.close();
     }
   }
   return undefined;
@@ -214,32 +220,45 @@ async function download(
   }
 }
 
-async function resolvePublicAddress(target: URL, timeoutMs: number): Promise<string> {
+const publicDnsCache = new Map<string, { address: string; expires: number }>();
+
+async function resolvePublicAddress(target: URL, timeoutMs: number, proxy?: string): Promise<string> {
   const hostname = target.hostname.replace(/^\[|\]$/g, '');
   if (isIP(hostname)) {
     if (isBlockedNetworkAddress(hostname)) throw new Error('目标地址属于本机、局域网或保留网段，已拒绝访问。');
     return hostname;
   }
+  const cached = publicDnsCache.get(hostname);
+  if (cached && cached.expires > Date.now()) return cached.address;
   let addresses: Array<{ address: string; family: number }>;
   try {
     addresses = await lookup(hostname, { all: true });
   } catch (error) {
-    throw new Error(`无法通过系统 DNS 安全解析目标域名：${error instanceof Error ? error.message : String(error)}`);
+    if (!proxy) throw new Error(`无法通过系统 DNS 安全解析目标域名：${error instanceof Error ? error.message : String(error)}`);
+    addresses = [];
   }
   if (addresses.some((item) => isBlockedNetworkAddress(item.address) && !isFakeIp(item.address))) {
     throw new Error('目标域名解析到了本机、局域网或保留地址，已拒绝访问。');
   }
   const fakeIp = addresses.find((item) => isFakeIp(item.address));
-  const address = fakeIp ? await resolveWithDoh(hostname, timeoutMs) : addresses[0]?.address;
+  const address = fakeIp || !addresses.length ? await resolveWithDoh(hostname, timeoutMs, proxy) : addresses[0]?.address;
   if (!address) throw new Error(`无法安全解析目标域名：${hostname}`);
   if (isBlockedNetworkAddress(address)) throw new Error('目标域名解析到了本机、局域网或保留地址，已拒绝访问。');
+  if (publicDnsCache.size >= 256) publicDnsCache.delete(publicDnsCache.keys().next().value!);
+  publicDnsCache.set(hostname, { address, expires: Date.now() + 60_000 });
   return address;
 }
 
-function replaceHostname(url: URL, address: string): string {
-  const pinned = new URL(url);
-  pinned.hostname = isIP(address) === 6 ? `[${address}]` : address;
-  return pinned.toString();
+export function pinnedProxyAgent(proxy: string, address: string): ProxyAgent {
+  // Keep the logical URL intact (Host, TLS identity and redirects). Pin only
+  // the proxy's CONNECT destination, rather than rewriting the fetch URL to an IP.
+  return new ProxyAgent({ uri: proxy, clientFactory: (origin, options) => new Pool(origin, options).compose((dispatch) => (request, handler) => {
+      if (request.method === 'CONNECT') {
+        const target = new URL(`https://${request.path}`);
+        return dispatch({ ...request, path: `${address.includes(':') ? `[${address}]` : address}:${target.port || '443'}` }, handler);
+      }
+      return dispatch(request, handler);
+    }) });
 }
 
 export async function readBodyLimited(
@@ -284,24 +303,19 @@ export async function readBodyLimited(
 }
 
 export async function fetchHtml(url: string, options: FetchOptions): Promise<string> {
-  const proxyUrl = options.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+  const proxyUrl = effectiveProxy(options.proxy);
   let currentUrl = url;
   let requestOptions = options;
   const deadline = Date.now() + options.timeoutMs;
   for (let redirect = 0; redirect <= 5; redirect += 1) {
     if (options.allowsUrl && !options.allowsUrl(currentUrl)) throw new Error('请求被书源声明的域名范围拒绝。');
     const target = validateRemoteTarget(currentUrl);
-    const address = await resolvePublicAddress(target, Math.max(deadline - Date.now(), 1));
+    const address = await resolvePublicAddress(target, Math.max(deadline - Date.now(), 1), proxyUrl);
     let dispatcher: Dispatcher;
     let requestUrl = currentUrl;
     let hostHeader: string | undefined;
     if (proxyUrl) {
-      requestUrl = replaceHostname(target, address);
-      hostHeader = target.host;
-      dispatcher = new ProxyAgent({
-        uri: proxyUrl,
-        requestTls: target.protocol === 'https:' ? { servername: target.hostname.replace(/^\[|\]$/g, '') } : undefined
-      });
+      dispatcher = pinnedProxyAgent(proxyUrl, address);
     } else {
       dispatcher = directAddressAgent(address);
     }

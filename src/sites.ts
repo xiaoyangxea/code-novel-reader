@@ -135,13 +135,14 @@ export const siteProfiles: SiteProfile[] = [
   {
     id: 'sudugu',
     name: '速读谷',
-    hosts: /(?:^|\.)sudugu\.org$/i,
+    hosts: /(?:^|\.)sudugu\.(?:org|co|cc)$/i,
     contentSelectors: ['.con'],
     catalogSelectors: ['#list'],
     chapterTitleSelectors: ['.submenu h1', 'h1'],
     bookTitleSelectors: ['.item h1 a', '.item h1', 'h1'],
     authorSelectors: ['.item p:nth-child(3) a', '.item .author'],
-    catalogPageUrlPattern: /\/\d+\/(?:p-\d+\.html)?$/i,
+    catalogPageUrlPattern: /^\/\d+\/(?:p-\d+\.html)?$/i,
+    provenance: 'https://github.com/XIU2/Yuedu', verifiedOn: '2026-10-12',
     maxCatalogPages: 100,
     catalogDelayMs: 200,
     inferCatalogUrl: (url) => {
@@ -150,8 +151,8 @@ export const siteProfiles: SiteProfile[] = [
     },
     search: {
       name: '速读谷',
-      url: 'https://www.sudugu.org/i/sor.aspx?key={keyword}',
-      kind: 'html'
+      url: 'https://www.sudugu.cc/modules/article/search.php',
+      kind: 'html', method: 'POST', form: { searchkey: '{keyword}', action: 'login', searchtype: 'all' }
     }
   },
   {

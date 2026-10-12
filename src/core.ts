@@ -20,7 +20,10 @@ export { BrowserAutomationBlockedError, browserIsolationArguments, findBrowserEx
 export { readChromiumCachedHtml, readChromiumCachedHtmlBatch } from './chromium-cache';
 export { ChapterService, BackgroundTaskCancelled } from './chapter-service';
 export { downloadIndexes, safeExportName } from './download-utils';
-export { filterSearchProviders, groupSearchResults } from './search-utils';
+export { filterSearchProviders, groupSearchResults, sourceFailureLabel } from './search-utils';
 export { searchNextPageUrl } from './adapters';
 export { encodeSearchForm } from './net';
-export { publicWebSearch } from './web-search';
+export { publicWebSearch, parseWebSearchHtml } from './web-search';
+export { detectLocalProxy, effectiveProxy, parseClashProxyPort } from './proxy';
+export { createBrowserRoute } from './browser-proxy';
+export { pinnedProxyAgent } from './net';

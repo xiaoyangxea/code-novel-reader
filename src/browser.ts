@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import { readChromiumCachedHtmlBatch } from './chromium-cache';
 import { resolveSafeRemoteUrl, type FetchOptions } from './net';
+import { createBrowserRoute, type BrowserRoute } from './browser-proxy';
 
 const maxRenderedBytes = 8_000_000;
 const verificationAttemptLifetimeMs = 30 * 60 * 1000;
@@ -11,6 +12,21 @@ const normalBrowserPreferenceLifetimeMs = 30 * 60 * 1000;
 let browserQueue: Promise<void> = Promise.resolve();
 const executableCache = new Map<string, string>();
 const normalBrowserPreferredUntil = new Map<string, number>();
+const verificationRoutes = new Set<BrowserRoute>();
+
+export async function closeVerificationRoutes(): Promise<void> {
+  await Promise.all([...verificationRoutes].map((route) => route.close()));
+  verificationRoutes.clear();
+}
+
+async function withBrowserRoute<T>(options: FetchOptions, operation: (route: BrowserRoute) => Promise<T>): Promise<T> {
+  const route = await createBrowserRoute(options);
+  try { return await operation(route); } finally { await route.close(); }
+}
+
+function browserNetworkArgs(route: BrowserRoute, url: string, address: string): string[] {
+  return [...route.args, ...(route.args.includes('--no-proxy-server') ? [hostResolverArgument(url, address)] : [])];
+}
 
 export const browserIsolationArguments = Object.freeze([
   '--disable-extensions', '--disable-sync', '--disable-background-networking',
@@ -182,11 +198,12 @@ async function renderHeadlessHtml(
   address: string,
   profile: string,
   timeoutMs: number,
-  renderedLimit: number
+  renderedLimit: number,
+  route: BrowserRoute
 ): Promise<string> {
   const args = [
-    '--headless=new', '--disable-gpu', '--mute-audio', '--no-proxy-server', ...browserIsolationArguments,
-    hostResolverArgument(safeUrl, address), `--user-data-dir=${profile}`,
+    '--headless=new', '--disable-gpu', '--mute-audio', ...browserIsolationArguments,
+    ...browserNetworkArgs(route, safeUrl, address), `--user-data-dir=${profile}`,
     `--virtual-time-budget=${Math.max(timeoutMs - 2_000, 5_000)}`, '--dump-dom', safeUrl
   ];
   const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
@@ -220,16 +237,17 @@ async function renderFromNormalBrowserCache(
   profile: string,
   cacheDirectoryRoot: string,
   timeoutMs: number,
-  renderedLimit: number
+  renderedLimit: number,
+  route: BrowserRoute
 ): Promise<Map<string, string>> {
   const safeUrl = safeUrls[0];
   if (!safeUrl) throw new Error('没有可供普通浏览器读取的 URL。');
   await mkdir(cacheDirectoryRoot, { recursive: true });
   const cacheRoot = await mkdtemp(path.join(cacheDirectoryRoot, 'request-'));
   const args = [
-    '--disable-gpu', '--mute-audio', '--no-proxy-server', ...browserIsolationArguments,
+    '--disable-gpu', '--mute-audio', ...browserIsolationArguments,
     '--start-minimized', '--window-size=800,600',
-    hostResolverArgument(safeUrl, address), `--user-data-dir=${profile}`, `--disk-cache-dir=${cacheRoot}`,
+    ...browserNetworkArgs(route, safeUrl, address), `--user-data-dir=${profile}`, `--disk-cache-dir=${cacheRoot}`,
     '--new-window', ...safeUrls
   ];
   const child = spawn(executable, args, { stdio: 'ignore', windowsHide: true });
@@ -276,7 +294,7 @@ export async function renderHtmlBatchWithBrowser(urls: string[], options: FetchO
   if (uniqueUrls.length === 0 || uniqueUrls.length > 5) throw new Error('普通浏览器批量读取每次只允许 1–5 个页面。');
   if (options.browserRendering === false) throw new Error('浏览器渲染已关闭。');
   if (!hasDesktopSession()) throw new Error('当前环境没有可用于普通浏览器缓存读取的桌面会话。');
-  const resolved = await Promise.all(uniqueUrls.map((url) => resolveSafeRemoteUrl(url, options.timeoutMs)));
+  const resolved = await Promise.all(uniqueUrls.map((url) => resolveSafeRemoteUrl(url, options.timeoutMs, options.proxy)));
   const first = resolved[0];
   if (!first) throw new Error('没有可供普通浏览器读取的 URL。');
   const origin = new URL(first.url).origin;
@@ -286,7 +304,7 @@ export async function renderHtmlBatchWithBrowser(urls: string[], options: FetchO
   if (!options.browserDataDirectory) throw new Error('浏览器隔离数据目录尚未初始化。');
   const profile = siteProfileDirectory(options.browserDataDirectory, first.url);
   await mkdir(profile, { recursive: true });
-  return queued(async () => {
+  return queued(() => withBrowserRoute(options, async (route) => {
     options.onProgress?.(`正在启动隔离浏览器批量读取 ${resolved.length} 个页面...`);
     const timeoutMs = Math.min(Math.max(options.browserTimeoutMs ?? options.timeoutMs, 12_000), 60_000);
     const renderedLimit = Math.min(options.maxBytes ?? maxRenderedBytes, maxRenderedBytes);
@@ -298,7 +316,8 @@ export async function renderHtmlBatchWithBrowser(urls: string[], options: FetchO
         profile,
         path.join(options.browserDataDirectory!, 'capture-cache'),
         timeoutMs,
-        renderedLimit
+        renderedLimit,
+        route
       );
       normalBrowserPreferredUntil.set(new URL(first.url).hostname.toLowerCase(), Date.now() + normalBrowserPreferenceLifetimeMs);
       return rendered;
@@ -308,11 +327,11 @@ export async function renderHtmlBatchWithBrowser(urls: string[], options: FetchO
       }
       throw error;
     }
-  });
+  }));
 }
 
 export async function renderHtmlWithBrowser(url: string, options: FetchOptions): Promise<string> {
-  const resolved = await resolveSafeRemoteUrl(url, options.timeoutMs);
+  const resolved = await resolveSafeRemoteUrl(url, options.timeoutMs, options.proxy);
   const safeUrl = resolved.url;
   if (options.browserRendering === false) throw new Error('浏览器渲染已关闭。');
   const executable = await findBrowserExecutable(options.browserExecutable);
@@ -322,7 +341,7 @@ export async function renderHtmlWithBrowser(url: string, options: FetchOptions):
   if (!options.browserDataDirectory) throw new Error('浏览器隔离数据目录尚未初始化。');
   const profile = siteProfileDirectory(options.browserDataDirectory, safeUrl);
   await mkdir(profile, { recursive: true });
-  return queued(async () => {
+  return queued(() => withBrowserRoute(options, async (route) => {
     const timeoutMs = Math.min(Math.max(options.browserTimeoutMs ?? options.timeoutMs, 12_000), 60_000);
     const renderedLimit = Math.min(options.maxBytes ?? maxRenderedBytes, maxRenderedBytes);
     const host = new URL(safeUrl).hostname.toLowerCase();
@@ -335,7 +354,8 @@ export async function renderHtmlWithBrowser(url: string, options: FetchOptions):
         profile,
         path.join(options.browserDataDirectory!, 'capture-cache'),
         timeoutMs,
-        renderedLimit
+        renderedLimit,
+        route
       );
       const html = rendered.get(safeUrl);
       if (!html) throw new Error('普通浏览器缓存中没有找到目标页面。');
@@ -357,7 +377,7 @@ export async function renderHtmlWithBrowser(url: string, options: FetchOptions):
     }
     options.onProgress?.('正在尝试无头浏览器读取页面...');
     try {
-      return await renderHeadlessHtml(executable, safeUrl, resolved.address, profile, timeoutMs, renderedLimit);
+      return await renderHeadlessHtml(executable, safeUrl, resolved.address, profile, timeoutMs, renderedLimit, route);
     } catch (error) {
       if (!(error instanceof BrowserVerificationRequiredError) || !hasDesktopSession()) throw error;
       try {
@@ -370,22 +390,31 @@ export async function renderHtmlWithBrowser(url: string, options: FetchOptions):
         throw cacheError;
       }
     }
-  });
+  }));
 }
 
 export async function startVerificationBrowser(url: string, options: FetchOptions): Promise<void> {
-  const resolved = await resolveSafeRemoteUrl(url, options.timeoutMs);
+  const resolved = await resolveSafeRemoteUrl(url, options.timeoutMs, options.proxy);
   const safeUrl = resolved.url;
   const executable = await findBrowserExecutable(options.browserExecutable);
   if (!executable) throw new Error('未找到可用于验证的 Chrome、Edge、Chromium 或 Brave。');
   if (!options.browserDataDirectory) throw new Error('浏览器隔离数据目录尚未初始化。');
   const profile = siteProfileDirectory(options.browserDataDirectory, safeUrl);
   await mkdir(profile, { recursive: true });
+  const route = await createBrowserRoute(options);
+  verificationRoutes.add(route);
   const args = [
-    '--no-proxy-server', ...browserIsolationArguments, hostResolverArgument(safeUrl, resolved.address), `--user-data-dir=${profile}`, '--new-window'
+    ...browserIsolationArguments, ...browserNetworkArgs(route, safeUrl, resolved.address), `--user-data-dir=${profile}`, '--new-window'
   ];
   args.push(safeUrl);
   const child = spawn(executable, args, { stdio: 'ignore', windowsHide: false, detached: true });
+  const stopRoute = () => { verificationRoutes.delete(route); void route.close(); };
+  child.once('exit', stopRoute);
+  child.once('error', stopRoute);
+  const lifetime = setTimeout(stopRoute, verificationAttemptLifetimeMs);
+  lifetime.unref();
+  child.once('exit', () => clearTimeout(lifetime));
+  child.once('error', () => clearTimeout(lifetime));
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       child.removeListener('error', onError);

@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { likelyCatalogUrl, loadCatalog, loadChapter } from './adapters';
-import { BrowserVerificationRequiredError, startVerificationBrowser } from './browser';
+import { BrowserVerificationRequiredError, closeVerificationRoutes, startVerificationBrowser } from './browser';
 import { LibraryProvider, BookItem } from './library';
 import { maxLocalBookBytes, parseEpub, parsePlainText } from './local';
 import { Book, NovelSource, ParsedCatalog } from './model';
@@ -13,9 +13,11 @@ import { ChapterService } from './chapter-service';
 import { DownloadManager } from './download';
 import { configureBoss, saveBoss } from './boss';
 import { searchOnlineUI } from './search-ui';
+import { detectLocalProxy, effectiveProxy } from './proxy';
 
 let activeReaderController: ReaderController | undefined;
 let activeDownloads: DownloadManager | undefined;
+let detectedProxy: string | undefined;
 
 function requestOptions(context: vscode.ExtensionContext, onProgress?: (message: string) => void) {
   const config = vscode.workspace.getConfiguration('codeNovel');
@@ -23,7 +25,8 @@ function requestOptions(context: vscode.ExtensionContext, onProgress?: (message:
   return {
     timeoutMs: config.get<number>('requestTimeout', 15000),
     userAgent: config.get<string>('userAgent', 'Mozilla/5.0'),
-    proxy: config.get<string>('proxy') || vscode.workspace.getConfiguration('http').get<string>('proxy') || undefined,
+    proxy: effectiveProxy(config.get<string>('proxy') || vscode.workspace.getConfiguration('http').get<string>('proxy'))
+      || (config.get<boolean>('autoDetectProxy', true) ? detectedProxy : undefined),
     browserRendering: config.get<boolean>('browserRendering', true),
     browserExecutable: executable || undefined,
     browserDataDirectory: path.join(context.globalStorageUri.fsPath, 'browser-profiles'),
@@ -272,7 +275,8 @@ async function showError(context: vscode.ExtensionContext, error: unknown): Prom
   vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  if (vscode.workspace.getConfiguration('codeNovel').get<boolean>('autoDetectProxy', true)) detectedProxy = await detectLocalProxy();
   const repository = new BookRepository(context);
   const sources = new SourceRepository(context);
   const documentProvider = new ReaderDocumentProvider();
@@ -357,6 +361,7 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
+  await closeVerificationRoutes();
   await activeDownloads?.shutdown();
   activeDownloads = undefined;
   await activeReaderController?.dispose();

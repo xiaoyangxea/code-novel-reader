@@ -7,7 +7,7 @@ import { SearchProviderConfig, SearchResult } from './model';
 import { SourceRepository } from './repository';
 import { searchNovelSources } from './source-rules';
 import { siteProfiles } from './sites';
-import { groupSearchResults } from './search-utils';
+import { groupSearchResults, sourceFailureLabel } from './search-utils';
 import { publicWebSearch } from './web-search';
 
 interface Item extends vscode.QuickPickItem { results?: SearchResult[]; action?: 'more' | 'discovery' | 'public' | 'status'; }
@@ -21,11 +21,12 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
   const mine = sources.getSources().filter((source) => source.enabled && source.search);
   const legacy = vscode.workspace.getConfiguration('codeNovel').get<SearchProviderConfig[]>('searchProviders', []);
   const selected = await vscode.window.showQuickPick([
+    { label: '聚合书源 + 全网搜索', description: '内置、自定义来源及 Bing、DuckDuckGo；搜索词会发送给这些服务', mode: 'combined', names: profiles.map((p) => p.search!.name) },
     { label: '全部已启用书源', mode: 'all', names: profiles.map((p) => p.search!.name) },
     { label: '公共/内置来源', mode: 'builtin', names: profiles.map((p) => p.search!.name) },
     { label: '我的书源', mode: 'custom', names: [] },
     { label: '网络发现（Brave API）', mode: 'discovery', names: [] },
-    { label: '公开网页搜索（实验，无需 Key）', description: '搜索词会发送给 DuckDuckGo，可用性取决于搜索网站', mode: 'public', names: [] },
+    { label: '全网搜索（Bing + DuckDuckGo，无需 Key）', description: '搜索词会发送给两个引擎，可直接在插件内导入发现的目录', mode: 'public', names: [] },
     ...profiles.map((p) => ({ label: p.name, mode: 'builtin-one', names: [p.search!.name] })),
     ...mine.map((p) => ({ label: p.name, mode: 'custom-one', names: [p.id] }))
   ], { title: '选择搜索来源' });
@@ -42,6 +43,7 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
   const more = new Set<string>();
   let page = 1;
   let discoveryPage = 0;
+  let publicPage = 0;
   let alive = true;
   let busy = false;
   let chosen: SearchResult[] | undefined;
@@ -53,7 +55,7 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
         detail: group.map((r) => `${r.provider}${r.catalogStatus === 'verified' ? '（目录已识别）' : r.catalogStatus === 'verification' ? '（需要验证）' : ''}`).join(' · '), results: group })),
       ...(!busy && more.size && page < 5 ? [{ label: '$(add) 加载更多站内结果', action: 'more' as const }] : []),
       { label: '$(globe) 扩大搜索范围（Brave API）', action: 'discovery' },
-      { label: '$(search) 公开网页补搜（实验）', action: 'public' },
+      ...(publicPage < 3 ? [{ label: '$(search) 全网补搜（Bing + DuckDuckGo）', action: 'public' as const }] : []),
       { label: `$(info) 来源状态（${statuses.size}）`, description: busy ? '搜索中…' : `${results.length} 条结果`, action: 'status' }
     ];
     picker.busy = busy;
@@ -61,24 +63,36 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
   const batch = (items: SearchResult[], provider: string, error?: string, hasMore?: boolean) => {
     if (!alive) return;
     for (const result of items) if (!results.some((r) => r.url === result.url)) results.push(result);
-    statuses.set(provider, error ? `失败：${error}` : `${items.length} 条结果${hasMore ? '，有后续分页' : ''}`);
-    if (hasMore && provider !== '网络发现' && provider !== '公开网页搜索') more.add(provider); else more.delete(provider);
+    statuses.set(provider, error ? sourceFailureLabel(error) : `${items.length} 条结果${hasMore ? '，有后续分页' : ''}`);
+    if (hasMore && provider !== '网络发现' && !provider.startsWith('全网')) more.add(provider); else more.delete(provider);
     update();
   };
   const probe = async (items: SearchResult[]) => {
-    for (const item of items.slice(0, 8)) {
-      if (!alive) break;
-      try {
-        const catalog = await loadCatalogPreview(likelyCatalogUrl(item.url) ?? item.url, { ...getOptions(), browserRendering: false });
-        if (catalog.chapters.length >= 2) {
-          item.title = catalog.title;
-          item.author = catalog.author;
-          item.chapterCount = catalog.chapters.length;
-          item.catalogStatus = 'verified';
+    const candidates = items.slice(0, 8);
+    let cursor = 0;
+    const worker = async () => {
+      while (alive && cursor < candidates.length) {
+        const item = candidates[cursor++]!;
+        try {
+          const options = getOptions();
+          const catalog = await loadCatalogPreview(likelyCatalogUrl(item.url) ?? item.url, {
+            ...options, timeoutMs: Math.min(options.timeoutMs, 5000), browserRendering: false
+          });
+          if (!alive) return;
+          if (catalog.chapters.length >= 2) {
+            item.title = catalog.title;
+            item.author = catalog.author;
+            item.chapterCount = catalog.chapters.length;
+            item.catalogStatus = 'verified';
+          }
+        } catch (error) {
+          if (!alive) return;
+          item.catalogStatus = error instanceof BrowserVerificationRequiredError ? 'verification' : 'unverified';
         }
-      } catch (error) { item.catalogStatus = error instanceof BrowserVerificationRequiredError ? 'verification' : 'unverified'; }
-      update();
-    }
+        update();
+      }
+    };
+    await Promise.all([worker(), worker()]);
   };
   const run = async (mode: string) => {
     if (busy || !alive) return;
@@ -93,18 +107,25 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
         const items = await discoverBooks(context, keyword, { ...options, searchPage: discoveryPage });
         await probe(items);
       } else if (mode === 'public') {
-        const items = await publicWebSearch(keyword, options);
-        batch(items, '公开网页搜索'); await probe(items);
+        if (publicPage >= 3) return;
+        publicPage += 1;
+        const items = await publicWebSearch(keyword, { ...options, searchPage: publicPage });
+        await probe(items);
       } else {
+        const all = mode === 'all' || mode === 'combined';
         await Promise.all([
-          ['all', 'builtin', 'builtin-one'].includes(mode)
-            ? searchBooks(keyword, mode === 'all' ? legacy : [], options,
-              [...selectedNames, ...(mode === 'all' ? legacy.map((p) => p.name) : [])]) : Promise.resolve(),
-          ['all', 'custom', 'custom-one'].includes(mode)
-            ? searchNovelSources(keyword, mode === 'custom-one' ? mine.filter((s) => selectedNames.includes(s.id)) : mine, options) : Promise.resolve()
+          ['all', 'combined', 'builtin', 'builtin-one'].includes(mode)
+            ? searchBooks(keyword, all ? legacy : [], options, selectedNames).catch((error) => batch([], '站内搜索', String(error))) : Promise.resolve(),
+          ['all', 'combined', 'custom', 'custom-one'].includes(mode)
+            ? searchNovelSources(keyword, mode === 'custom-one' ? mine.filter((s) => selectedNames.includes(s.id)) : mine, options) : Promise.resolve(),
+          ...(mode === 'combined' && publicPage === 0 ? [(async () => {
+            publicPage += 1;
+            const items = await publicWebSearch(keyword, { ...options, searchPage: publicPage });
+            await probe(items);
+          })().catch((error) => batch([], '全网搜索', String(error)))] : [])
         ]);
       }
-    } catch (error) { if (alive) statuses.set(mode, error instanceof Error ? error.message : String(error)); }
+    } catch (error) { if (alive) statuses.set(mode, sourceFailureLabel(error instanceof Error ? error.message : String(error))); }
     finally { busy = false; if (alive) update(); }
   };
   const done = new Promise<void>((resolve) => {

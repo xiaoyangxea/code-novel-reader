@@ -422,7 +422,7 @@ function catalogIdentity(profile: SiteProfile, rawUrl: string): string | undefin
 
 function catalogPageNumber(rawUrl: string): number {
   const path = new URL(rawUrl).pathname;
-  const match = path.match(/(?:_|p-|asc-|\/cs\/)(\d+)\/?$/i);
+  const match = path.match(/(?:_|p-|asc-|\/cs\/)(\d+)(?:\.html)?\/?$/i);
   return match?.[1] ? Number(match[1]) : 1;
 }
 
@@ -463,7 +463,7 @@ export function catalogPageUrls(html: string, url: string): string[] {
       if (candidate.hostname !== current.hostname) return [];
       if (profile.catalogPageUrlPattern && !profile.catalogPageUrlPattern.test(candidate.pathname)) return [];
       const candidateIdentity = catalogIdentity(profile, resolved);
-      if (identity && candidateIdentity && identity !== candidateIdentity) return [];
+      if (identity && candidateIdentity !== identity) return [];
       candidate.hash = '';
       const normalized = candidate.toString();
       if (seen.has(normalized)) return [];
@@ -477,7 +477,8 @@ export function catalogPageUrls(html: string, url: string): string[] {
 
 function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): SearchResult[] {
   const results: SearchResult[] = [];
-  const isBookHref = (href: string) => /(?:\/\d+[_/]\d*\/?$|\/(?:book|novel|info|shu|b)\/|\/onebook\.php\?novelid=|\/wiki\/|\/ebooks\/|\/\d+\/$)/i.test(href);
+  const isBookHref = (href: string) => !/\/(?:sort|category|class|blist|rank|top|search|tag|user|login)(?:\/|\.|\?)/i.test(href)
+    && /(?:\/\d+[_/]\d*\/?$|\/(?:book|novel|info|shu|b)\/|\/onebook\.php\?novelid=|\/wiki\/|\/ebooks\/|\/\d+\/$)/i.test(href);
   $('.grid tr,table tr,.search-list li,.result-list li,.search-result-list li,.search-result-item,.search-tab li,.bookbox,.book-item,.newbox li,.book-img-text li,.bookinfo,.book,.book-li,.novel-item,.result-item').each((_, row) => {
     if (results.length >= 100) return false;
     const links = $(row).find('a[href]').toArray();
@@ -486,7 +487,7 @@ function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): Sear
       const label = tidy($(link).text());
       return label.length >= 2 && !chapterTitlePattern.test(label) && !/最新章节|立即阅读|详情/.test(label)
         && isBookHref(href);
-    }) ?? links[0];
+    });
     if (!bookLink) {
       return;
     }

@@ -6,6 +6,7 @@ import { configureDiscovery, hasDiscoveryKey } from './discovery';
 import { assertHttpUrl, generateNovelSource, normalizeNovelSource, testNovelSource } from './source-rules';
 import { siteProfiles } from './sites';
 import { loadCatalogPreview, loadChapter, likelyCatalogUrl, searchBooks } from './adapters';
+import { sourceFailureLabel } from './search-utils';
 
 async function readSourceImport(options: FetchOptions): Promise<{ source: NovelSource; label: string } | undefined> {
   const method = await vscode.window.showQuickPick([
@@ -201,7 +202,7 @@ export async function manageSources(
           const chapter = await loadChapter(catalog.chapters[0]!.url, options);
           return `通过：${searched.results.length} 条结果，${catalog.chapters.length} 章，正文 ${chapter.content.length} 字`;
         });
-      } catch (error) { detail = `未通过：${error instanceof Error ? error.message : String(error)}`; }
+      } catch (error) { detail = `本次未通过：${sourceFailureLabel(error instanceof Error ? error.message : String(error))}`; }
       checks[profile.id] = { date: new Date().toISOString().slice(0, 10), detail: detail.slice(0, 500) };
       await context.globalState.update('codeNovel.sourceChecks', checks);
       vscode.window.showInformationMessage(`${profile.name}：${detail}`);

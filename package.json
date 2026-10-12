@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -301,7 +301,13 @@
         "codeNovel.proxy": {
           "type": "string",
           "default": "",
-          "description": "可选 HTTP/HTTPS 代理，例如 http://127.0.0.1:7890。留空时读取 VS Code http.proxy 和环境变量。"
+          "description": "可选 HTTP/HTTPS 代理，例如 http://127.0.0.1:7897。普通请求与隔离浏览器共用；留空时读取 VS Code http.proxy、环境变量，再尝试检测本机 Clash Verge 混合端口。"
+        },
+        "codeNovel.autoDetectProxy": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "未指定代理时，读取本机 Clash Verge 的混合端口并检测是否监听，使 TUN 环境下普通请求与隔离浏览器使用同一代理。"
         },
         "codeNovel.browserRendering": {
           "type": "boolean",
