@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
 import { Book, BookKind, ChapterContent, NovelSource, ReadingProgress } from './model';
 import { normalizeNovelSource } from './source-rules';
+import { siteProfiles } from './sites';
 
 const booksKey = 'codeNovel.books.v1';
 const progressKey = 'codeNovel.progress.v1';
@@ -159,13 +160,18 @@ export class SourceRepository {
   }
 
   isBuiltInEnabled(id: string): boolean {
-    return !this.getDisabledBuiltIns().includes(id);
+    if (this.getDisabledBuiltIns().includes(id)) return false;
+    return !siteProfiles.find((profile) => profile.id === id)?.experimental
+      || this.context.globalState.get<string[]>('codeNovel.enabledExperimentalSources', []).includes(id);
   }
 
   async setBuiltInEnabled(id: string, enabled: boolean): Promise<void> {
     const disabled = new Set(this.getDisabledBuiltIns());
     if (enabled) disabled.delete(id); else disabled.add(id);
     await this.context.globalState.update(disabledBuiltInsKey, [...disabled]);
+    const experimental = new Set(this.context.globalState.get<string[]>('codeNovel.enabledExperimentalSources', []));
+    if (enabled) experimental.add(id); else experimental.delete(id);
+    await this.context.globalState.update('codeNovel.enabledExperimentalSources', [...experimental]);
     this.changeEmitter.fire();
   }
 }

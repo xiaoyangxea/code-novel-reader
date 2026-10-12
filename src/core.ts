@@ -18,3 +18,9 @@ export { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, rend
 export { normalizeNovelSource, parseSourceSearchHtml } from './source-rules';
 export { BrowserAutomationBlockedError, browserIsolationArguments, findBrowserExecutable, isBrowserChallengeHtml, renderHtmlBatchWithBrowser, renderHtmlWithBrowser, startVerificationBrowser } from './browser';
 export { readChromiumCachedHtml, readChromiumCachedHtmlBatch } from './chromium-cache';
+export { ChapterService, BackgroundTaskCancelled } from './chapter-service';
+export { downloadIndexes, safeExportName } from './download-utils';
+export { filterSearchProviders, groupSearchResults } from './search-utils';
+export { searchNextPageUrl } from './adapters';
+export { encodeSearchForm } from './net';
+export { publicWebSearch } from './web-search';

@@ -4,6 +4,9 @@ export interface BuiltInSearchProvider {
   name: string;
   url: string;
   kind: SearchKind;
+  method?: 'POST';
+  form?: Record<string, string>;
+  charset?: 'utf-8' | 'gbk' | 'gb18030';
 }
 
 export interface SiteProfile {
@@ -24,6 +27,9 @@ export interface SiteProfile {
   largestCatalogContainer?: boolean;
   inferChapterPageUrl?: (url: URL, nextPage: number) => string | undefined;
   search?: BuiltInSearchProvider;
+  provenance?: string;
+  experimental?: boolean;
+  verifiedOn?: string;
 }
 
 function parentDirectory(url: URL): string | undefined {
@@ -35,6 +41,33 @@ function parentDirectory(url: URL): string | undefined {
 }
 
 export const siteProfiles: SiteProfile[] = [
+  {
+    id: 'shoujix', name: '手机小说', hosts: /(?:^|\.)shoujix\.com$/i,
+    contentSelectors: ['#content', '.chapter-content'], catalogSelectors: ['#list', '.listmain', '.chapter-list'],
+    chapterTitleSelectors: ['.bookname h1', 'h1'], bookTitleSelectors: ['#info h1', 'h1'],
+    authorSelectors: ['meta[property="og:novel:author"]', '#info p'], inferCatalogUrl: parentDirectory,
+    search: { name: '手机小说', url: 'https://www.shoujix.com/modules/article/search.php', kind: 'html',
+      method: 'POST', form: { searchkey: '{keyword}' }, charset: 'gbk' },
+    provenance: 'https://github.com/XIU2/Yuedu', experimental: true
+  },
+  {
+    id: 'deqixs', name: '得奇小说网', hosts: /(?:^|\.)deqixs\.com$/i,
+    contentSelectors: ['#content', '.chapter-content', '.read-content'],
+    catalogSelectors: ['#list', '.chapter-list', '.listmain', '.list-chapter'],
+    chapterTitleSelectors: ['.bookname h1', 'h1'], bookTitleSelectors: ['#info h1', '.book-info h1', 'h1'],
+    authorSelectors: ['meta[property="og:novel:author"]', '#info p'], inferCatalogUrl: parentDirectory,
+    search: { name: '得奇小说网', url: 'https://www.deqixs.com/tag/?key={keyword}', kind: 'html' },
+    provenance: 'https://github.com/XIU2/Yuedu', experimental: true
+  },
+  {
+    id: 'kuaishu', name: '快书网', hosts: /(?:^|\.)kuaishu5\.com$/i,
+    contentSelectors: ['#content', '.chapter-content', '.read-content'],
+    catalogSelectors: ['#list', '.chapter-list', '.listmain', '.list-chapter'],
+    chapterTitleSelectors: ['.bookname h1', 'h1'], bookTitleSelectors: ['#info h1', '.book-info h1', 'h1'],
+    authorSelectors: ['meta[property="og:novel:author"]', '#info p'], inferCatalogUrl: parentDirectory,
+    search: { name: '快书网', url: 'https://www.kuaishu5.com/search/?searchkey={keyword}', kind: 'html' },
+    provenance: 'https://github.com/XIU2/Yuedu', experimental: true
+  },
   {
     id: 'qidiy',
     name: '启迪小说',
@@ -160,6 +193,8 @@ export const siteProfiles: SiteProfile[] = [
     chapterTitleSelectors: ['.title h1', 'h1'],
     bookTitleSelectors: ['meta[name="og:novel:book_name"]', 'h1', 'title'],
     authorSelectors: ['meta[name="og:novel:author"]', '.author'],
+    search: { name: '天天看小说', url: 'https://cn.ttkan.co/novel/search?q={keyword}', kind: 'html' },
+    provenance: 'https://github.com/XIU2/Yuedu', experimental: true,
     inferCatalogUrl: (url) => {
       const match = url.pathname.match(/\/novel\/(?:chapters|pagea)\/([^/]+)/i);
       return match?.[1] ? `${url.origin}/novel/chapters/${match[1].replace(/_\d+\.html$/i, '')}` : undefined;

@@ -6,6 +6,7 @@ import { ChapterContent, ChapterRef, NovelSource, ParsedCatalog, SearchProviderC
 import { FetchOptions, fetchHtml, resolveUrl } from './net';
 import { builtInSearchProviders, BuiltInSearchProvider, profileForUrl, SiteProfile } from './sites';
 import { requireSourceUrl, sourceAllowsUrl } from './source-policy';
+import { filterSearchProviders } from './search-utils';
 
 const chapterTitlePattern = /^(?:正文\s*)?(?:第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章回卷节篇部集]|chapter\s*\d+|序章|序言|楔子|引子|前言|后记|番外|尾声)/i;
 const noisePattern = /^(?:上一章|下一章|上一页|下一页|返回目录|章节目录|手机阅读|加入书签|投推荐票|请记住|最新网址|本章未完|点击下一页|喜欢.*请收藏|天才一秒记住)/i;
@@ -476,8 +477,8 @@ export function catalogPageUrls(html: string, url: string): string[] {
 
 function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): SearchResult[] {
   const results: SearchResult[] = [];
-  const isBookHref = (href: string) => /(?:\/\d+[_/]\d*\/?$|\/book\/|\/novel\/|\/info\/|\/onebook\.php\?novelid=|\/wiki\/|\/ebooks\/|\/\d+\/$)/i.test(href);
-  $('.grid tr,table tr,.search-list li,.result-list li,.search-result-list li,.search-result-item,.search-tab li,.bookbox,.book-item,.newbox li').each((_, row) => {
+  const isBookHref = (href: string) => /(?:\/\d+[_/]\d*\/?$|\/(?:book|novel|info|shu|b)\/|\/onebook\.php\?novelid=|\/wiki\/|\/ebooks\/|\/\d+\/$)/i.test(href);
+  $('.grid tr,table tr,.search-list li,.result-list li,.search-result-list li,.search-result-item,.search-tab li,.bookbox,.book-item,.newbox li,.book-img-text li,.bookinfo,.book,.book-li,.novel-item,.result-item').each((_, row) => {
     if (results.length >= 100) return false;
     const links = $(row).find('a[href]').toArray();
     const bookLink = links.find((link) => {
@@ -521,8 +522,29 @@ function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): Sear
 
 export function parseSearchHtml(html: string, baseUrl: string, provider: string): SearchResult[] {
   assertReadablePage(html);
-  return parseSearchRows(cheerio.load(html), baseUrl, provider);
+  const $ = cheerio.load(html);
+  // Some exact-title searches return the book detail/catalog directly.
+  if ($('meta[property="og:novel:book_name"],meta[name="og:novel:book_name"]').length
+    || ($('#info h1,.book-info h1').length && $('#list,.chapter-list,.section-list').length)) {
+    try {
+      const catalog = parseCatalogHtml(html, baseUrl);
+      if (catalog.chapters.length >= 2) return [{ title: catalog.title, author: catalog.author, url: baseUrl,
+        provider, chapterCount: catalog.chapters.length, catalogStatus: 'verified' }];
+    } catch { /* Fall through to search rows. */ }
+  }
+  return parseSearchRows($, baseUrl, provider);
 }
+
+export function searchNextPageUrl(html: string, currentUrl: string, selector?: string): string | undefined {
+  const $ = cheerio.load(html);
+  const link = selector ? $(selector).first() : $('a[href]').filter((_, node) =>
+    /^(?:下一页|下页|下一頁|next)(?:[\s>›»→]*)$/i.test(tidy($(node).text())) || $(node).attr('rel') === 'next').first();
+  const url = resolveUrl(link.attr('href'), currentUrl);
+  if (!url || url === currentUrl || new URL(url).origin !== new URL(currentUrl).origin) return undefined;
+  return url;
+}
+
+const searchPages = new Map<string, Map<number, string>>();
 
 export function parseMediaWikiSearch(json: string, provider: BuiltInSearchProvider): SearchResult[] {
   const data = JSON.parse(json) as { query?: { search?: Array<{ title?: string; snippet?: string }> } };
@@ -606,7 +628,8 @@ async function browserFallback<T>(
 
 async function loadCatalogPage(url: string, options: FetchOptions, source?: NovelSource): Promise<{ html: string; catalog: ParsedCatalog }> {
   const parse = (html: string) => ({ html, catalog: parseCatalogHtml(html, url, source) });
-  const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
+  const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000),
+    ...(source ? { allowsUrl: (value: string) => sourceAllowsUrl(source, value) } : {}) };
   return browserFallback(url, limited, async () => parse(await fetchHtml(url, limited)), parse);
 }
 
@@ -654,7 +677,8 @@ async function loadChapterPage(
   source?: NovelSource
 ): Promise<{ html: string; chapter: ChapterContent; page: ReturnType<typeof chapterPageState> }> {
   const parse = (html: string) => parseLoadedChapterPage(html, url, options, source);
-  const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
+  const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000),
+    ...(source ? { allowsUrl: (value: string) => sourceAllowsUrl(source, value) } : {}) };
   return browserFallback(url, limited, async () => parse(await fetchHtml(url, { ...limited, referer: url })), parse);
 }
 
@@ -675,37 +699,63 @@ export async function searchBooks(
   providerFilter?: string[]
 ): Promise<{ results: SearchResult[]; errors: string[] }> {
   let providers: BuiltInSearchProvider[] = [
-    ...builtInSearchProviders,
+    ...filterSearchProviders(builtInSearchProviders, providerFilter),
     ...customProviders.map((provider) => ({ ...provider, kind: 'html' as const }))
   ];
-  if (providerFilter?.length) {
-    providers = providers.filter((provider) => providerFilter.includes(provider.name));
-  }
   const errors: string[] = [];
   let verificationError: BrowserVerificationRequiredError | undefined;
   providers = providers.slice(0, 50);
   const results: SearchResult[] = [];
   for (let offset = 0; offset < providers.length; offset += 5) {
+    if (options.shouldContinue?.() === false) break;
     const batch = await Promise.all(providers.slice(offset, offset + 5).map(async (provider) => {
-      const url = provider.url.replaceAll('{keyword}', encodeURIComponent(keyword));
+      const page = Math.min(Math.max(options.searchPage ?? 1, 1), 5);
+      const cacheKey = `${provider.url}:${keyword}`;
+      let url = provider.url.replaceAll('{keyword}', encodeURIComponent(keyword)).replaceAll('{page}', String(page));
+      if (page > 1 && !provider.url.includes('{page}') && provider.kind !== 'zongheng') {
+        const discovered = searchPages.get(cacheKey)?.get(page);
+        if (!discovered) return [];
+        url = discovered;
+      }
+      if (provider.kind === 'zongheng') { const parsed = new URL(url); parsed.searchParams.set('pageNo', String(page)); url = parsed.toString(); }
       try {
-        const htmlOptions = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000) };
+        let effectiveUrl = url;
+        const htmlOptions = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000),
+          method: provider.method, charset: provider.charset,
+          form: provider.form ? Object.fromEntries(Object.entries(provider.form).map(([key, value]) =>
+            [key, value.replaceAll('{keyword}', keyword).replaceAll('{page}', String(page))])) : undefined,
+          onFinalUrl: (value: string) => { effectiveUrl = value; } };
+        let parsedResults: SearchResult[] = [];
+        const parse = (value: string) => {
+          parsedResults = parseSearchHtml(value, effectiveUrl, provider.name);
+          const $ = cheerio.load(value);
+          const visibleText = $('body').text();
+          if (!parsedResults.length && !/没有找到|未找到|暂无|没有搜索到|无搜索结果|未搜索到/.test(visibleText)) {
+            throw new Error('搜索页没有匹配结果结构，可能需要浏览器渲染。');
+          }
+          return value;
+        };
         const html = provider.kind === 'html'
-          ? await browserFallback(url, htmlOptions, async () => {
+          ? await browserFallback(url, { ...htmlOptions, browserRendering: provider.method === 'POST' ? false : options.browserRendering }, async () => {
             const value = await fetchHtml(url, htmlOptions);
-            assertReadablePage(value);
-            return value;
-          }, (value) => {
-            assertReadablePage(value);
-            return value;
-          })
+            return parse(value);
+          }, parse)
           : await fetchHtml(url, htmlOptions);
-        if (provider.kind === 'mediawiki') return parseMediaWikiSearch(html, provider);
-        if (provider.kind === 'zongheng') return parseZonghengSearch(html, provider);
-        return parseSearchHtml(html, url, provider.name);
+        if (provider.kind === 'mediawiki') parsedResults = parseMediaWikiSearch(html, provider);
+        if (provider.kind === 'zongheng') parsedResults = parseZonghengSearch(html, provider);
+        const next = provider.kind === 'html' ? searchNextPageUrl(html, effectiveUrl) : undefined;
+        if (next) {
+          if (searchPages.size >= 100) searchPages.delete(searchPages.keys().next().value!);
+          const pages = searchPages.get(cacheKey) ?? new Map<number, string>();
+          pages.set(page + 1, next); searchPages.set(cacheKey, pages);
+        }
+        options.onSearchBatch?.(parsedResults, provider.name, undefined, page < 5 && Boolean(next ||
+          ((provider.url.includes('{page}') || provider.kind === 'zongheng') && parsedResults.length > 0)));
+        return parsedResults;
       } catch (error) {
         if (error instanceof BrowserVerificationRequiredError) verificationError ??= error;
         errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
+        options.onSearchBatch?.([], provider.name, errorMessage(error));
         return [];
       }
     }));

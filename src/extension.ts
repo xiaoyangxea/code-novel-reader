@@ -1,18 +1,21 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { likelyCatalogUrl, loadCatalog, loadCatalogPreview, loadChapter, searchBooks } from './adapters';
+import { likelyCatalogUrl, loadCatalog, loadChapter } from './adapters';
 import { BrowserVerificationRequiredError, startVerificationBrowser } from './browser';
-import { discoverBooks, hasDiscoveryKey } from './discovery';
 import { LibraryProvider, BookItem } from './library';
 import { maxLocalBookBytes, parseEpub, parsePlainText } from './local';
-import { Book, NovelSource, ParsedCatalog, SearchProviderConfig, SearchResult } from './model';
+import { Book, NovelSource, ParsedCatalog } from './model';
 import { ReaderController, ReaderDocumentProvider } from './reader';
 import { BookRepository, SourceRepository, stableId } from './repository';
 import { manageSources } from './source-manager';
-import { assertHttpUrl, searchNovelSources } from './source-rules';
-import { siteProfiles } from './sites';
+import { assertHttpUrl } from './source-rules';
+import { ChapterService } from './chapter-service';
+import { DownloadManager } from './download';
+import { configureBoss, saveBoss } from './boss';
+import { searchOnlineUI } from './search-ui';
 
 let activeReaderController: ReaderController | undefined;
+let activeDownloads: DownloadManager | undefined;
 
 function requestOptions(context: vscode.ExtensionContext, onProgress?: (message: string) => void) {
   const config = vscode.workspace.getConfiguration('codeNovel');
@@ -34,7 +37,7 @@ async function catalogFromUrl(
   url: string,
   source?: NovelSource,
   onProgress?: (message: string) => void
-): Promise<{ catalog: ParsedCatalog; selectedIndex: number }> {
+): Promise<{ catalog: ParsedCatalog; selectedIndex: number; complete: boolean }> {
   const inferredCatalogUrl = likelyCatalogUrl(url);
   for (const candidate of [...new Set([inferredCatalogUrl, url].filter((value): value is string => Boolean(value)))]) {
     try {
@@ -42,6 +45,7 @@ async function catalogFromUrl(
       if (directCatalog.chapters.length >= 2) {
         return {
           catalog: directCatalog,
+          complete: true,
           selectedIndex: Math.max(0, directCatalog.chapters.findIndex((item) => item.url === url))
         };
       }
@@ -57,7 +61,7 @@ async function catalogFromUrl(
       const catalog = await loadCatalog(candidate, requestOptions(context, onProgress), source);
       if (catalog.chapters.length >= 2) {
         const selectedIndex = Math.max(0, catalog.chapters.findIndex((item) => item.url === url));
-        return { catalog, selectedIndex };
+        return { catalog, selectedIndex, complete: true };
       }
     } catch {
       // Continue with the next inferred catalog URL.
@@ -67,7 +71,8 @@ async function catalogFromUrl(
   if (chapter.nextUrl) chapters.push({ title: '下一章（待加载）', url: chapter.nextUrl });
   return {
     catalog: { title: chapter.title.replace(/第.+?[章回].*$/, '').trim() || '在线小说', chapters },
-    selectedIndex: 0
+    selectedIndex: 0,
+    complete: false
   };
 }
 
@@ -96,7 +101,7 @@ async function importOnlineUrl(
     { location: vscode.ProgressLocation.Notification, title: '正在识别小说目录和章节...' },
     async (progress) => {
       const source = sources.getSource(sourceId) ?? sources.findForUrl(url);
-      const { catalog, selectedIndex } = await catalogFromUrl(context, url, source, (message) => progress.report({ message }));
+      const { catalog, selectedIndex, complete } = await catalogFromUrl(context, url, source, (message) => progress.report({ message }));
       const book: Book = {
         id: stableId('online', catalog.chapters[0]?.url ? likelyCatalogUrl(catalog.chapters[0].url) ?? url : url),
         title: catalog.title,
@@ -105,6 +110,7 @@ async function importOnlineUrl(
         source: url,
         sourceId: source?.id,
         chapters: catalog.chapters,
+        catalogComplete: complete,
         addedAt: Date.now()
       };
       await repository.saveBook(book);
@@ -164,6 +170,7 @@ async function refreshCatalog(context: vscode.ExtensionContext, repository: Book
   book.title = refreshed.catalog.title;
   book.author = refreshed.catalog.author;
   book.chapters = refreshed.catalog.chapters;
+  book.catalogComplete = refreshed.complete;
   book.sourceId = source?.id;
   await repository.saveBook(book);
   const chapterIndex = currentUrl ? book.chapters.findIndex((chapter) => chapter.url === currentUrl) : -1;
@@ -175,29 +182,7 @@ async function refreshCatalog(context: vscode.ExtensionContext, repository: Book
   vscode.window.showInformationMessage(`目录已更新，共 ${book.chapters.length} 章。`);
 }
 
-async function probeDiscoveryResults(context: vscode.ExtensionContext, results: SearchResult[]): Promise<SearchResult[]> {
-  const output: SearchResult[] = [];
-  for (let offset = 0; offset < Math.min(results.length, 8); offset += 3) {
-    const batch = results.slice(offset, offset + 3);
-    output.push(...await Promise.all(batch.map(async (result) => {
-      const inferred = likelyCatalogUrl(result.url);
-      for (const candidate of [...new Set([inferred, result.url].filter((value): value is string => Boolean(value)))]) {
-        try {
-          const catalog = await loadCatalogPreview(candidate, requestOptions(context));
-          if (catalog.chapters.length >= 2) {
-            return { ...result, title: catalog.title || result.title };
-          }
-        } catch {
-          // Keep the discovery result as an unverified URL.
-        }
-      }
-      return result;
-    })));
-  }
-  return [...output, ...results.slice(8)];
-}
-
-async function removeFromLibrary(repository: BookRepository, item: BookItem): Promise<void> {
+async function removeFromLibrary(repository: BookRepository, item: BookItem, beforeRemove: () => Promise<void>): Promise<void> {
   const book = item.book;
   if (book.kind === 'txt' || book.kind === 'epub') {
     const sourcePath = path.resolve(book.source);
@@ -224,6 +209,7 @@ async function removeFromLibrary(repository: BookRepository, item: BookItem): Pr
         }
       }
     }
+    await beforeRemove();
     await repository.removeBook(book.id);
     vscode.window.showInformationMessage(answer === '移除并删除源文件'
       ? `已移除《${book.title}》，本地源文件已移至回收站。`
@@ -236,7 +222,7 @@ async function removeFromLibrary(repository: BookRepository, item: BookItem): Pr
     { modal: true },
     '移除'
   );
-  if (answer === '移除') await repository.removeBook(book.id);
+  if (answer === '移除') { await beforeRemove(); await repository.removeBook(book.id); }
 }
 
 async function importLocal(repository: BookRepository, reader: ReaderController): Promise<void> {
@@ -270,86 +256,6 @@ async function importLocal(repository: BookRepository, reader: ReaderController)
   );
 }
 
-async function searchOnline(
-  context: vscode.ExtensionContext,
-  repository: BookRepository,
-  sources: SourceRepository,
-  reader: ReaderController
-): Promise<void> {
-  const keyword = await vscode.window.showInputBox({ title: '搜索在线小说', prompt: '输入书名或作者', placeHolder: '小说名称' });
-  if (!keyword) return;
-  if (keyword.length > 100 || /[\u0000-\u001f\u007f]/.test(keyword)) {
-    throw new Error('搜索词不能超过 100 个字符，也不能包含控制字符。');
-  }
-  const config = vscode.workspace.getConfiguration('codeNovel');
-  const customProviders = config.get<SearchProviderConfig[]>('searchProviders', []);
-  const enabledBuiltIns = siteProfiles.filter((profile) => profile.search && sources.isBuiltInEnabled(profile.id));
-  const customSources = sources.getSources().filter((source) => source.enabled && source.search);
-  const source = await vscode.window.showQuickPick([
-    { label: '全部已启用书源', description: '内置来源、我的书源和设置中的兼容入口', mode: 'all', names: enabledBuiltIns.map((item) => item.search!.name) },
-    { label: '公共/内置来源', description: '只搜索启用的内置来源', mode: 'builtin', names: enabledBuiltIns.map((item) => item.search!.name) },
-    { label: '我的书源', description: customSources.length ? `${customSources.length} 个可搜索书源` : '尚未导入带搜索规则的书源', mode: 'custom', names: [] },
-    { label: '网络发现', description: '使用用户配置的 Brave Search API，结果需确认后导入', mode: 'discovery', names: [] },
-    ...enabledBuiltIns.map((profile) => ({ label: profile.name, description: '内置来源', mode: 'builtin-one', names: [profile.search!.name] })),
-    ...customSources.map((item) => ({ label: item.name, description: item.domains.join(', '), mode: 'custom-one', names: [item.id] }))
-  ], { placeHolder: '选择搜索来源' });
-  if (!source) return;
-  if (source.mode === 'discovery' && !await hasDiscoveryKey(context)) {
-    const action = await vscode.window.showWarningMessage(
-      '网络发现需要你自己的 Brave Search API Key。也可以先在系统浏览器搜索，再把目录 URL 粘贴到扩展。',
-      '配置网络发现',
-      '在浏览器搜索'
-    );
-    if (action === '配置网络发现') await vscode.commands.executeCommand('codeNovel.manageSources');
-    if (action === '在浏览器搜索') {
-      const query = encodeURIComponent(`"${keyword}" 小说 目录 在线阅读`);
-      await vscode.env.openExternal(vscode.Uri.parse(`https://search.brave.com/search?q=${query}`));
-    }
-    return;
-  }
-  let results: SearchResult[] = [];
-  let errors: string[] = [];
-  await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `正在搜索“${keyword}”...` },
-    async () => {
-      if (source.mode === 'discovery') {
-        results = await discoverBooks(context, keyword, requestOptions(context));
-        results = await probeDiscoveryResults(context, results);
-        return;
-      }
-      if (source.mode === 'all' || source.mode === 'builtin' || source.mode === 'builtin-one') {
-        const legacyProviders = source.mode === 'all' ? customProviders : [];
-        const builtIn = await searchBooks(keyword, legacyProviders, requestOptions(context), source.names);
-        results.push(...builtIn.results);
-        errors.push(...builtIn.errors);
-      }
-      if (source.mode === 'all' || source.mode === 'custom' || source.mode === 'custom-one') {
-        const selectedSources = source.mode === 'custom-one'
-          ? customSources.filter((item) => source.names.includes(item.id))
-          : customSources;
-        const mine = await searchNovelSources(keyword, selectedSources, requestOptions(context));
-        results.push(...mine.results);
-        errors.push(...mine.errors);
-      }
-    }
-  );
-  results = results.filter((item, index) => results.findIndex((other) => other.url === item.url) === index);
-  if (results.length === 0) {
-    const detail = errors.length ? `\n${errors.join('\n')}` : '';
-    vscode.window.showWarningMessage(`没有搜索到结果。${detail}`);
-    return;
-  }
-  const picked = await vscode.window.showQuickPick(results.map((result) => ({
-    label: result.title,
-    description: [result.author, result.provider, result.chapterCount ? `已识别 ${result.chapterCount} 章` : undefined].filter(Boolean).join(' · '),
-    detail: result.latestChapter,
-    result
-  })), { placeHolder: '选择要导入的小说', matchOnDescription: true, matchOnDetail: true });
-  if (picked) {
-    await importOnlineUrl(context, repository, sources, reader, picked.result.url, picked.result.sourceId);
-  }
-}
-
 async function showError(context: vscode.ExtensionContext, error: unknown): Promise<void> {
   if (error instanceof BrowserVerificationRequiredError) {
     const action = await vscode.window.showWarningMessage(
@@ -375,15 +281,33 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showErrorMessage(nested instanceof Error ? nested.message : String(nested));
     });
   };
-  const reader = new ReaderController(repository, documentProvider, sources, context, handleError);
+  const chapters = new ChapterService(repository, (onProgress) => requestOptions(context, onProgress), (id) => sources.getSource(id));
+  const reader = new ReaderController(repository, documentProvider, sources, context, chapters, handleError);
+  const downloads = new DownloadManager(context, repository, chapters, async (book) => {
+    if (book.catalogComplete !== true) await refreshCatalog(context, repository, sources, book);
+    if (!book.catalogComplete) throw new Error('只识别了单章链接，整书下载需要可用的完整目录，请先导入目录 URL。');
+  });
   activeReaderController = reader;
-  const library = new LibraryProvider(repository, () => sources.getSources().length);
+  activeDownloads = downloads;
+  const library = new LibraryProvider(repository, () => sources.getSources().length, (id) => downloads.summary(id));
+  context.subscriptions.push(downloads.onDidChange(() => library.refresh()));
   context.subscriptions.push(sources.onDidChange(() => library.refresh()));
 
   context.subscriptions.push(
+    downloads,
     vscode.workspace.registerTextDocumentContentProvider('code-novel', documentProvider),
     vscode.window.registerTreeDataProvider('codeNovel.library', library),
-    vscode.commands.registerCommand('codeNovel.searchOnline', () => searchOnline(context, repository, sources, reader).catch(handleError)),
+    vscode.commands.registerCommand('codeNovel.searchOnline', () => searchOnlineUI(context, sources, () => requestOptions(context),
+      (result) => importOnlineUrl(context, repository, sources, reader, result.url, result.sourceId)).catch(handleError)),
+    vscode.commands.registerCommand('codeNovel.downloadBook', async (item?: BookItem | Book) => {
+      let book = item instanceof BookItem ? item.book : item;
+      if (!book) book = (await vscode.window.showQuickPick(repository.getBooks().filter((b) => b.kind === 'online')
+        .map((b) => ({ label: b.title, book: b })), { title: '选择下载或导出的书籍' }))?.book;
+      if (!book) return;
+      await downloads.manage(book).catch(handleError);
+    }),
+    vscode.commands.registerCommand('codeNovel.configureBoss', () => configureBoss(context, reader).catch(handleError)),
+    vscode.commands.registerCommand('codeNovel.saveBossContent', () => saveBoss(context, reader).catch(handleError)),
     vscode.commands.registerCommand('codeNovel.importUrl', () => importOnlineUrl(context, repository, sources, reader).catch(handleError)),
     vscode.commands.registerCommand('codeNovel.openLocal', () => importLocal(repository, reader).catch(handleError)),
     vscode.commands.registerCommand('codeNovel.openBook', (item?: BookItem | Book) => {
@@ -392,7 +316,11 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('codeNovel.removeBook', async (item?: BookItem) => {
       if (!item) return;
-      await removeFromLibrary(repository, item).catch(handleError);
+      await removeFromLibrary(repository, item, async () => {
+        reader.forgetBook(item.book.id);
+        await downloads.remove(item.book.id);
+        await chapters.cancelBook(item.book.id);
+      }).catch(handleError);
     }),
     vscode.commands.registerCommand('codeNovel.openCatalog', (item?: BookItem | Book) => {
       const book = item instanceof BookItem ? item.book : item;
@@ -429,6 +357,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
+  await activeDownloads?.shutdown();
+  activeDownloads = undefined;
   await activeReaderController?.dispose();
   activeReaderController = undefined;
 }

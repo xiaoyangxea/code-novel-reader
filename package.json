@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -42,6 +42,19 @@
   ],
   "contributes": {
     "commands": [
+      {
+        "command": "codeNovel.downloadBook",
+        "title": "代码小说: 下载到本地 / 导出 TXT",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "codeNovel.configureBoss",
+        "title": "代码小说: 设置老板键显示内容"
+      },
+      {
+        "command": "codeNovel.saveBossContent",
+        "title": "代码小说: 保存当前编辑器为老板键内容"
+      },
       {
         "command": "codeNovel.searchOnline",
         "title": "代码小说: 搜索在线小说",
@@ -203,6 +216,11 @@
       ],
       "view/item/context": [
         {
+          "command": "codeNovel.downloadBook",
+          "when": "view == codeNovel.library && viewItem == codeNovel.book",
+          "group": "navigation@3"
+        },
+        {
           "command": "codeNovel.openCatalog",
           "when": "view == codeNovel.library && viewItem == codeNovel.book",
           "group": "inline@1"
@@ -348,15 +366,15 @@
     "package": "npm run check && npm test && npm run compile:production && vsce package --no-dependencies"
   },
   "dependencies": {
-    "cheerio": "^1.1.2",
+    "cheerio": "^1.2.0",
     "iconv-lite": "^0.6.3",
     "jszip": "^3.10.1",
-    "undici": "^6.21.1"
+    "undici": "^6.29.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/vscode": "^1.90.0",
-    "@vscode/vsce": "^3.7.1",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.7.2"
   }

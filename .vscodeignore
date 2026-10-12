@@ -4,6 +4,7 @@
 .gitignore
 src/**
 tests/**
+scripts/**
 node_modules/**
 dist/core.js
 dist/**/*.map

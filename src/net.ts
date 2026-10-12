@@ -2,6 +2,7 @@ import * as iconv from 'iconv-lite';
 import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
 import { Agent, Dispatcher, fetch as undiciFetch, ProxyAgent } from 'undici';
+import type { SearchResult } from './model';
 
 const maxResponseBytes = 8_000_000;
 const blockedAddresses = new BlockList();
@@ -27,12 +28,30 @@ export interface FetchOptions {
   browserDataDirectory?: string;
   browserTimeoutMs?: number;
   onProgress?: (message: string) => void;
+  searchPage?: number;
+  shouldContinue?: () => boolean;
+  onSearchBatch?: (results: SearchResult[], provider: string, error?: string, hasMore?: boolean) => void;
+  method?: 'GET' | 'POST';
+  form?: Record<string, string>;
+  charset?: 'utf-8' | 'gbk' | 'gb18030';
+  onFinalUrl?: (url: string) => void;
+  allowsUrl?: (url: string) => boolean;
 }
 
 interface DownloadedResponse {
   bytes: Buffer;
   contentType: string | null;
   redirectUrl?: string;
+  redirectStatus?: number;
+}
+
+export function encodeSearchForm(form: Record<string, string>, charset: 'utf-8' | 'gbk' | 'gb18030' = 'utf-8'): string {
+  const entries = Object.entries(form);
+  if (entries.length > 20 || entries.some(([key, value]) => key.length > 100 || typeof value !== 'string' || value.length > 500
+    || /^(?:cookie|authorization|password|token|secret)$/i.test(key))) throw new Error('搜索表单字段过多、过长或包含凭据。');
+  const encode = (value: string) => [...iconv.encode(value, charset)].map((byte) =>
+    /[A-Za-z0-9_.~-]/.test(String.fromCharCode(byte)) ? String.fromCharCode(byte) : `%${byte.toString(16).padStart(2, '0').toUpperCase()}`).join('');
+  return entries.map(([key, value]) => `${encode(key)}=${encode(value)}`).join('&');
 }
 
 export function assertSafeRemoteUrl(rawUrl: string): string {
@@ -159,19 +178,22 @@ async function download(
       redirect: 'manual',
       signal: controller.signal,
       dispatcher,
+      method: options.method ?? 'GET',
+      body: options.method === 'POST' && options.form ? encodeSearchForm(options.form, options.charset) : undefined,
       headers: {
         'User-Agent': options.userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
         ...(hostHeader ? { Host: hostHeader } : {}),
-        ...(options.referer ? { Referer: options.referer } : {})
+        ...(options.referer ? { Referer: options.referer } : {}),
+        ...(options.method === 'POST' ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {})
       }
     });
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) throw new Error(`HTTP ${response.status} 缺少重定向地址`);
       await response.body?.cancel();
-      return { bytes: Buffer.alloc(0), contentType: null, redirectUrl: new URL(location, logicalUrl).toString() };
+      return { bytes: Buffer.alloc(0), contentType: null, redirectUrl: new URL(location, logicalUrl).toString(), redirectStatus: response.status };
     }
     if (!response.ok) {
       await response.body?.cancel();
@@ -264,8 +286,10 @@ export async function readBodyLimited(
 export async function fetchHtml(url: string, options: FetchOptions): Promise<string> {
   const proxyUrl = options.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
   let currentUrl = url;
+  let requestOptions = options;
   const deadline = Date.now() + options.timeoutMs;
   for (let redirect = 0; redirect <= 5; redirect += 1) {
+    if (options.allowsUrl && !options.allowsUrl(currentUrl)) throw new Error('请求被书源声明的域名范围拒绝。');
     const target = validateRemoteTarget(currentUrl);
     const address = await resolvePublicAddress(target, Math.max(deadline - Date.now(), 1));
     let dispatcher: Dispatcher;
@@ -285,15 +309,20 @@ export async function fetchHtml(url: string, options: FetchOptions): Promise<str
     try {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) throw new Error(`请求超时（${options.timeoutMs}ms）: ${url}`);
-      result = await download(requestUrl, currentUrl, { ...options, timeoutMs: remainingMs }, dispatcher, hostHeader);
+      result = await download(requestUrl, currentUrl, { ...requestOptions, timeoutMs: remainingMs }, dispatcher, hostHeader);
     } finally {
       await dispatcher.close();
     }
     if (result.redirectUrl) {
+      if (requestOptions.method === 'POST') {
+        if ([301, 302, 303].includes(result.redirectStatus ?? 0)) requestOptions = { ...requestOptions, method: 'GET', form: undefined };
+        else if (new URL(result.redirectUrl).origin !== new URL(currentUrl).origin) throw new Error('拒绝将搜索表单跨域重定向。');
+      }
       currentUrl = result.redirectUrl;
       continue;
     }
     const charset = detectCharset(result.bytes, result.contentType);
+    options.onFinalUrl?.(currentUrl);
     return iconv.decode(result.bytes, iconv.encodingExists(charset) ? charset : 'utf-8');
   }
   throw new Error('网页重定向超过 5 次，已停止访问。');

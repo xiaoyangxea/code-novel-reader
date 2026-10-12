@@ -5,6 +5,7 @@ import { SourceRepository } from './repository';
 import { configureDiscovery, hasDiscoveryKey } from './discovery';
 import { assertHttpUrl, generateNovelSource, normalizeNovelSource, testNovelSource } from './source-rules';
 import { siteProfiles } from './sites';
+import { loadCatalogPreview, loadChapter, likelyCatalogUrl, searchBooks } from './adapters';
 
 async function readSourceImport(options: FetchOptions): Promise<{ source: NovelSource; label: string } | undefined> {
   const method = await vscode.window.showQuickPick([
@@ -151,13 +152,14 @@ export async function manageSources(
 ): Promise<void> {
   const discoveryConfigured = await hasDiscoveryKey(context);
   const customSources = repository.getSources();
+  const checks = context.globalState.get<Record<string, { date: string; detail: string }>>('codeNovel.sourceChecks', {});
   const selected = await vscode.window.showQuickPick([
     { label: '$(cloud-download) 导入书源', description: '本地 JSON、粘贴 JSON 或订阅 URL', entryType: 'action', id: 'import' },
     { label: '$(wand) 根据目录 URL 自动生成', description: '分析目录和第一章后保存规则', entryType: 'action', id: 'generate' },
     { label: '$(globe) 网络发现设置', description: discoveryConfigured ? 'Brave Search API 已配置' : '未配置 API Key', entryType: 'action', id: 'discovery' },
     ...siteProfiles.filter((profile) => profile.search).map((profile) => ({
       label: `${repository.isBuiltInEnabled(profile.id) ? '$(check)' : '$(circle-slash)'} ${profile.name}`,
-      description: '内置公共/固定搜索来源',
+      description: `${profile.experimental ? '实验来源（默认关闭）' : '内置来源'}${checks[profile.id] ? ` · ${checks[profile.id]!.date} ${checks[profile.id]!.detail}` : ''}`,
       entryType: 'builtin',
       id: profile.id
     })),
@@ -176,11 +178,34 @@ export async function manageSources(
     return;
   }
   if (selected.entryType === 'builtin') {
+    const profile = siteProfiles.find((item) => item.id === selected.id)!;
     const enabled = repository.isBuiltInEnabled(selected.id);
     const answer = await vscode.window.showQuickPick([
-      { label: enabled ? '禁用此搜索来源' : '启用此搜索来源', value: !enabled }
-    ], { title: selected.label.replace(/^\$\([^)]+\)\s*/, '') });
-    if (answer) await repository.setBuiltInEnabled(selected.id, answer.value);
+      { label: enabled ? '禁用此搜索来源' : '启用此搜索来源', action: 'toggle' },
+      { label: '测试搜索、目录和正文', action: 'test' },
+      ...(profile.provenance ? [{ label: '查看来源出处', action: 'origin' }] : [])
+    ], { title: profile.name });
+    if (answer?.action === 'toggle') await repository.setBuiltInEnabled(selected.id, !enabled);
+    if (answer?.action === 'origin' && profile.provenance) await vscode.env.openExternal(vscode.Uri.parse(profile.provenance));
+    if (answer?.action === 'test') {
+      const keyword = await vscode.window.showInputBox({ title: `测试 ${profile.name}`, prompt: '输入一本你知道该站有的书名' });
+      if (!keyword) return;
+      let detail = '';
+      try {
+        detail = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '测试搜索、目录和第一章…' }, async () => {
+          const searched = await searchBooks(keyword, [], options, [profile.search!.name]);
+          if (!searched.results.length) throw new Error(searched.errors.join('；') || '搜索结果为零');
+          const first = searched.results[0]!;
+          const catalog = await loadCatalogPreview(likelyCatalogUrl(first.url) ?? first.url, options);
+          if (!catalog.chapters.length) throw new Error('未识别目录');
+          const chapter = await loadChapter(catalog.chapters[0]!.url, options);
+          return `通过：${searched.results.length} 条结果，${catalog.chapters.length} 章，正文 ${chapter.content.length} 字`;
+        });
+      } catch (error) { detail = `未通过：${error instanceof Error ? error.message : String(error)}`; }
+      checks[profile.id] = { date: new Date().toISOString().slice(0, 10), detail: detail.slice(0, 500) };
+      await context.globalState.update('codeNovel.sourceChecks', checks);
+      vscode.window.showInformationMessage(`${profile.name}：${detail}`);
+    }
     return;
   }
   const source = repository.getSource(selected.id);

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio/slim';
 import type { CheerioAPI, Cheerio } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import { loadCatalog, loadChapter, parseCatalogHtml, parseChapterHtml } from './adapters';
+import { loadCatalog, loadChapter, parseCatalogHtml, parseChapterHtml, searchNextPageUrl } from './adapters';
 import { BrowserVerificationRequiredError, renderHtmlWithBrowser } from './browser';
 import { NovelSource, ParsedCatalog, SearchResult } from './model';
 import { assertSafeRemoteUrl, FetchOptions, fetchHtml, resolveUrl } from './net';
@@ -80,15 +80,32 @@ export function normalizeNovelSource(input: unknown, subscriptionUrl?: string): 
   if (root.search !== undefined) {
     const value = record(root.search, 'search');
     const searchUrl = text(value.url, 'search.url')!;
-    if (!/\{\{?keyword\}?\}/.test(searchUrl)) throw new Error('search.url 必须包含 {keyword} 或 {{keyword}}。');
+    const method = value.method ?? 'GET';
+    if (method !== 'GET' && method !== 'POST') throw new Error('搜索只允许 GET 或 POST。');
+    let form: Record<string, string> | undefined;
+    if (value.form !== undefined) {
+      const fields = record(value.form, 'search.form');
+      if (Object.keys(fields).length > 20 || Object.entries(fields).some(([key, field]) => key.length > 100
+        || /^(?:cookie|authorization|password|token|secret)$/i.test(key) || typeof field !== 'string' || field.length > 500)) {
+        throw new Error('搜索表单字段无效、过长或含有凭据。');
+      }
+      form = fields as Record<string, string>;
+    }
+    if (method === 'POST' && !form) throw new Error('POST 搜索必须提供 form。');
+    if (method === 'GET' && form) throw new Error('只有 POST 搜索可以提供 form。');
+    const charset = value.charset ?? 'utf-8';
+    if (charset !== 'utf-8' && charset !== 'gbk' && charset !== 'gb18030') throw new Error('搜索表单编码不支持。');
+    if (!/\{\{?keyword\}?\}/.test(`${searchUrl} ${Object.values(form ?? {}).join(' ')}`)) throw new Error('搜索 URL 或 form 必须包含 {keyword}。');
     assertHttpUrl(searchUrl.replace(/\{\{?keyword\}?\}/g, 'test'), 'search.url');
     search = {
       url: searchUrl,
+      method, form, charset,
       resultSelector: selector(value.resultSelector, 'search.resultSelector')!,
       titleSelector: selector(value.titleSelector, 'search.titleSelector')!,
       urlSelector: selector(value.urlSelector, 'search.urlSelector')!,
       authorSelector: selector(value.authorSelector, 'search.authorSelector', true),
-      latestChapterSelector: selector(value.latestChapterSelector, 'search.latestChapterSelector', true)
+      latestChapterSelector: selector(value.latestChapterSelector, 'search.latestChapterSelector', true),
+      nextPageSelector: selector(value.nextPageSelector, 'search.nextPageSelector', true)
     };
   }
   const normalized: NovelSource = {
@@ -167,7 +184,7 @@ async function sourcePageHtml(
   } catch (error) {
     staticError = error;
   }
-  if (options.browserRendering === false) throw staticError;
+  if (options.browserRendering === false || options.method === 'POST') throw staticError;
   try {
     const html = await renderHtmlWithBrowser(url, limited);
     validate(html);
@@ -177,6 +194,8 @@ async function sourcePageHtml(
     throw new Error(`普通抓取失败：${staticError instanceof Error ? staticError.message : String(staticError)}；浏览器渲染也失败：${error instanceof Error ? error.message : String(error)}`);
   }
 }
+
+const customSearchPages = new Map<string, Map<number, string>>();
 
 export async function searchNovelSources(
   keyword: string,
@@ -188,18 +207,41 @@ export async function searchNovelSources(
   const results: SearchResult[] = [];
   let verificationError: BrowserVerificationRequiredError | undefined;
   for (let offset = 0; offset < enabled.length; offset += 5) {
+    if (options.shouldContinue?.() === false) break;
     const batch = await Promise.all(enabled.slice(offset, offset + 5).map(async (source) => {
-      const url = source.search!.url.replace(/\{\{?keyword\}?\}/g, encodeURIComponent(keyword));
+      const page = Math.min(Math.max(options.searchPage ?? 1, 1), 5);
+      const key = `${source.id}:${keyword}`;
+      let url = source.search!.url.replace(/\{\{?keyword\}?\}/g, encodeURIComponent(keyword)).replace(/\{\{?page\}?\}/g, String(page));
+      if (page > 1 && !/\{\{?page\}?\}/.test(source.search!.url)) {
+        const discovered = customSearchPages.get(key)?.get(page);
+        if (!discovered) return [];
+        url = discovered;
+      }
       try {
         let parsed: SearchResult[] = [];
-        const html = await sourcePageHtml(url, options, (value) => {
-          parsed = parseSourceSearchHtml(value, url, source);
+        let effectiveUrl = url;
+        const searchOptions = { ...options, method: source.search!.method, charset: source.search!.charset,
+          form: source.search!.form ? Object.fromEntries(Object.entries(source.search!.form).map(([key, value]) =>
+            [key, value.replace(/\{\{?keyword\}?\}/g, () => keyword).replace(/\{\{?page\}?\}/g, String(page))])) : undefined,
+          allowsUrl: (value: string) => sourceAllowsUrl(source, value),
+          onFinalUrl: (value: string) => { effectiveUrl = value; } };
+        const html = await sourcePageHtml(url, searchOptions, (value) => {
+          parsed = parseSourceSearchHtml(value, effectiveUrl, source);
           if (parsed.length === 0) throw new Error('搜索页没有匹配书源规则。');
         });
-        return parsed.length ? parsed : parseSourceSearchHtml(html, url, source);
+        const results = parsed.length ? parsed : parseSourceSearchHtml(html, url, source);
+        const next = searchNextPageUrl(html, effectiveUrl, source.search!.nextPageSelector);
+        if (next && sourceAllowsUrl(source, next)) {
+          if (customSearchPages.size >= 100) customSearchPages.delete(customSearchPages.keys().next().value!);
+          const pages = customSearchPages.get(key) ?? new Map<number, string>();
+          pages.set(page + 1, next); customSearchPages.set(key, pages);
+        }
+        options.onSearchBatch?.(results, source.name, undefined, page < 5 && Boolean(next || (/\{\{?page\}?\}/.test(source.search!.url) && results.length > 0)));
+        return results;
       } catch (error) {
         if (error instanceof BrowserVerificationRequiredError) verificationError ??= error;
         errors.push(`${source.name}: ${error instanceof Error ? error.message : String(error)}`);
+        options.onSearchBatch?.([], source.name, error instanceof Error ? error.message : String(error));
         return [];
       }
     }));

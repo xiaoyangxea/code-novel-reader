@@ -32,7 +32,8 @@ export class LibraryProvider implements vscode.TreeDataProvider<BookItem | Sourc
   private readonly emitter = new vscode.EventEmitter<BookItem | SourceManagerItem | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
 
-  constructor(private readonly repository: BookRepository, private readonly sourceCount: () => number) {
+  constructor(private readonly repository: BookRepository, private readonly sourceCount: () => number,
+    private readonly downloadSummary: (id: string) => string = () => '') {
     repository.onDidChange(() => this.refresh());
   }
 
@@ -47,7 +48,7 @@ export class LibraryProvider implements vscode.TreeDataProvider<BookItem | Sourc
   getChildren(): Array<BookItem | SourceManagerItem> {
     const books = this.repository.getBooks().map((book) => {
       const progress = this.repository.getProgress(book.id);
-      const detail = `${book.kind === 'online' ? '在线' : book.kind.toUpperCase()} · ${progress.chapterIndex + 1}/${Math.max(book.chapters.length, 1)}`;
+      const detail = `${book.kind === 'online' ? '在线' : book.kind.toUpperCase()} · ${progress.chapterIndex + 1}/${Math.max(book.chapters.length, 1)}${this.downloadSummary(book.id) ? ` · ${this.downloadSummary(book.id)}` : ''}`;
       return new BookItem(book, detail);
     });
     return [new SourceManagerItem(this.sourceCount()), ...books];

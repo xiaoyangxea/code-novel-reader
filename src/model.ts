@@ -13,6 +13,7 @@ export interface Book {
   source: string;
   sourceId?: string;
   chapters: ChapterRef[];
+  catalogComplete?: boolean;
   addedAt: number;
 }
 
@@ -39,6 +40,7 @@ export interface SearchResult {
   provider: string;
   sourceId?: string;
   chapterCount?: number;
+  catalogStatus?: 'verified' | 'unverified' | 'verification';
 }
 
 export interface SearchProviderConfig {
@@ -54,11 +56,15 @@ export interface ParsedCatalog {
 
 export interface NovelSourceSearchRule {
   url: string;
+  method?: 'GET' | 'POST';
+  form?: Record<string, string>;
+  charset?: 'utf-8' | 'gbk' | 'gb18030';
   resultSelector: string;
   titleSelector: string;
   urlSelector: string;
   authorSelector?: string;
   latestChapterSelector?: string;
+  nextPageSelector?: string;
 }
 
 export interface NovelSourceCatalogRule {

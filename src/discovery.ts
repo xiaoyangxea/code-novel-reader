@@ -51,8 +51,11 @@ export async function discoverBooks(
   const apiKey = await context.secrets.get(braveKeyName);
   if (!apiKey) throw new Error('尚未配置 Brave Search API Key，请先打开“书源管理 → 网络发现设置”。');
   const endpoint = new URL('https://api.search.brave.com/res/v1/web/search');
-  endpoint.searchParams.set('q', `"${keyword}" 小说 目录 在线阅读`);
-  endpoint.searchParams.set('count', '10');
+  const page = Math.min(Math.max(options.searchPage ?? 1, 1), 5);
+  const queries = [`${keyword} 小说 目录`, `"${keyword}" 在线阅读`, `${keyword} 小说 全部章节`];
+  endpoint.searchParams.set('q', queries[(page - 1) % queries.length]!);
+  endpoint.searchParams.set('count', '20');
+  endpoint.searchParams.set('offset', String(Math.floor((page - 1) / queries.length)));
   endpoint.searchParams.set('search_lang', 'zh-hans');
   endpoint.searchParams.set('safesearch', 'moderate');
   const proxyUrl = options.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
@@ -82,9 +85,10 @@ export async function discoverBooks(
     }
     const bytes = await readBodyLimited(response, 2_000_000, '搜索接口响应');
     const data = JSON.parse(bytes.toString('utf8')) as {
+      query?: { more_results_available?: boolean };
       web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
     };
-    return (data.web?.results ?? []).flatMap((item) => {
+    const results: SearchResult[] = (data.web?.results ?? []).flatMap((item) => {
       if (!item.title || !item.url) return [];
       let domain: string;
       try {
@@ -101,6 +105,8 @@ export async function discoverBooks(
         latestChapter: item.description?.replace(/<[^>]+>/g, '')
       }];
     });
+    options.onSearchBatch?.(results, '网络发现', undefined, Boolean(data.query?.more_results_available) && page < 5);
+    return results;
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') throw new Error('网络发现请求超时。');
     throw error;
