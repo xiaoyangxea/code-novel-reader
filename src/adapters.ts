@@ -2,11 +2,13 @@ import * as cheerio from 'cheerio/slim';
 import type { CheerioAPI } from 'cheerio';
 import type { AnyNode } from 'domhandler';
 import { BrowserAutomationBlockedError, BrowserVerificationRequiredError, isBrowserChallengeHtml, renderHtmlBatchWithBrowser, renderHtmlWithBrowser } from './browser';
-import { ChapterContent, ChapterRef, NovelSource, ParsedCatalog, SearchProviderConfig, SearchResult } from './model';
-import { FetchOptions, fetchHtml, resolveUrl } from './net';
+import { Book, ChapterContent, ChapterRef, NovelSource, ParsedCatalog, SearchProviderConfig, SearchResult } from './model';
+import { FetchOptions, fetchHtml, resolveUrl, RateLimitedError } from './net';
 import { builtInSearchProviders, BuiltInSearchProvider, profileForUrl, SiteProfile } from './sites';
 import { requireSourceUrl, sourceAllowsUrl } from './source-policy';
-import { filterSearchProviders } from './search-utils';
+import { filterSearchProviders, relevantSearchResults, siteSearchQuery } from './search-utils';
+import { cleanAuthor } from './book-metadata';
+import { RestrictedChapterError, isSuspectedCachedExcerpt } from './chapter-quality';
 
 const chapterTitlePattern = /^(?:正文\s*)?(?:第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章回卷节篇部集]|chapter\s*\d+|序章|序言|楔子|引子|前言|后记|番外|尾声)/i;
 const noisePattern = /^(?:上一章|下一章|上一页|下一页|返回目录|章节目录|手机阅读|加入书签|投推荐票|请记住|最新网址|本章未完|点击下一页|喜欢.*请收藏|天才一秒记住)/i;
@@ -217,10 +219,15 @@ export function parseChapterHtml(html: string, url: string, source?: NovelSource
   assertReadablePage(html);
   const $ = cheerio.load(html);
   const profile = customProfile(source, url);
-  const rawTitle = titleFromPage($, profile).replace(/\s*[（(]第\s*\d+\s*\/\s*\d+\s*[页頁][）)]\s*$/i, '').trim();
+  const rawTitle = titleFromPage($, profile).replace(/\s*[（(](?:第\s*)?\d+\s*\/\s*\d+\s*[页頁]?[）)]\s*$/i, '').trim();
   const breadcrumbTitle = rawTitle.split(/\s*[>›»]\s*/).at(-1)?.trim() ?? rawTitle;
   const title = chapterTitlePattern.test(breadcrumbTitle) ? breadcrumbTitle : rawTitle;
   const content = cleanChapterPageText(selectContent($, profile), title);
+  const masked = $('#article.isMask,.chapter-content.isMask,.chapter-content[data-locked="true"],.chapter-content[data-preview="true"]').filter((_, node) =>
+    !$(node).is('[hidden],[aria-hidden="true"]') && !/display\s*:\s*none/i.test($(node).attr('style') ?? '')).length > 0;
+  const accessPrompt = $('#article,.chapter-content,#content').text();
+  if (masked || isSuspectedCachedExcerpt({ url, content, title })
+    || /(?:本章|章节|正文).{0,24}(?:订阅后|购买后|付费后)|^\s*请(?:先)?(?:登录|登陆)(?:后)?(?:阅读|查看)/.test(accessPrompt.trim())) throw new RestrictedChapterError();
   if (content.length < 80) {
     throw new Error('未能识别正文；页面可能需要登录、使用动态脚本，或站点规则尚未适配。');
   }
@@ -243,7 +250,7 @@ function chapterRefsFromAnchors($: CheerioAPI, anchors: AnyNode[], baseUrl: stri
     if (chapters.length >= 20_000) return false;
     const title = tidy($(anchor).text());
     const url = resolveUrl($(anchor).attr('href'), baseUrl);
-    if (title && url && !catalogNoisePattern.test(title) && !/\/totaltome\//i.test(url)
+    if (title && url && chapterLinkCompatible(url, baseUrl, title) && !catalogNoisePattern.test(title) && !/\/totaltome\//i.test(url)
       && (chapterTitlePattern.test(title) || title.length >= 2)) {
       chapters.push({ title, url });
     }
@@ -251,11 +258,48 @@ function chapterRefsFromAnchors($: CheerioAPI, anchors: AnyNode[], baseUrl: stri
   return dedupeChapters(chapters);
 }
 
+function chapterLinkCompatible(rawUrl: string, baseUrl: string, title: string): boolean {
+  const target = new URL(rawUrl);
+  const base = new URL(baseUrl);
+  if (target.href === base.href) return false;
+  const profile = profileForUrl(baseUrl);
+  const targetCatalog = profile?.inferCatalogUrl?.(new URL(rawUrl));
+  const currentCatalog = profile?.inferCatalogUrl?.(new URL(baseUrl));
+  if (targetCatalog && currentCatalog) {
+    const current = new URL(currentCatalog);
+    const inferred = new URL(targetCatalog);
+    return profileForUrl(rawUrl)?.id === profile?.id && current.pathname === inferred.pathname && current.search === inferred.search;
+  }
+  const directory = base.pathname.replace(/(?:catalog|list|index)\/?$/i, '');
+  if (directory.endsWith('/') && /\d|\/(?:book|novel|shu|xs-|ibook)\//i.test(directory)) {
+    if (target.pathname.startsWith(directory) && target.pathname !== directory) return true;
+    const bookId = directory.match(/\/(?:book|novel|shu)\/(\d+)/)?.[1];
+    if (bookId && new RegExp(`^/(?:read|chapter|book)/${bookId}(?:/|$)`).test(target.pathname)) return true;
+    // A root-level chapter endpoint may use global IDs. Only explicit chapter
+    // labels qualify; another book's directory or a generic recommendation does not.
+    return chapterTitlePattern.test(title) && /\.(?:html?|aspx|php)$/i.test(target.pathname)
+      && target.pathname.split('/').filter(Boolean).length === 1;
+  }
+  return true;
+}
+
 function anchorsFromContainer($: CheerioAPI, selector: string, baseUrl: string, largestOnly = false): ChapterRef[] {
-  if (!largestOnly) return chapterRefsFromAnchors($, $(selector).find('a[href]').toArray(), baseUrl);
+  const selected = $(selector);
+  const latest = new Set<AnyNode>();
+  selected.find('dt,h2,h3').each((_, heading) => {
+    if (!/最新章节|最近更新/.test(tidy($(heading).text()))) return;
+    const siblings = $(heading).siblings('dt,h2,h3');
+    if (!siblings.toArray().some((node) => /正文|全部章节|完整目录|章节列表|全部目录/.test(tidy($(node).text())))) return;
+    $(heading).nextAll().each((_, sibling) => {
+      if ($(sibling).is('dt,h2,h3')) return false;
+      for (const anchor of $(sibling).find('a[href]').add($(sibling).filter('a[href]')).toArray()) latest.add(anchor);
+    });
+  });
+  const anchorsFor = (container: AnyNode[]) => $(container).find('a[href]').toArray().filter((anchor) => !latest.has(anchor));
+  if (!largestOnly) return chapterRefsFromAnchors($, anchorsFor(selected.toArray()), baseUrl);
   let best: ChapterRef[] = [];
-  $(selector).each((_, container) => {
-    const current = chapterRefsFromAnchors($, $(container).find('a[href]').toArray(), baseUrl);
+  selected.each((_, container) => {
+    const current = chapterRefsFromAnchors($, anchorsFor([container]), baseUrl);
     if (current.length > best.length) best = current;
   });
   return best;
@@ -307,10 +351,19 @@ function chapterOrdinal(title: string): number | undefined {
 }
 
 function normalizeCatalogOrder(chapters: ChapterRef[], profile?: SiteProfile): ChapterRef[] {
-  if (!(profile?.id === 'mayiwsk' || profile?.sortCatalogByOrdinal) || chapters.length < 3) return chapters;
+  if (chapters.length < 2) return chapters;
   const indexed = chapters.map((chapter, index) => ({ chapter, index, ordinal: chapterOrdinal(chapter.title) }));
   const numbered = indexed.filter((item) => item.ordinal !== undefined);
   if (numbered.length / chapters.length < 0.65) return chapters;
+  const explicitSort = profile?.id === 'mayiwsk' || profile?.sortCatalogByOrdinal;
+  if (!explicitSort) {
+    // Only reverse a clearly descending, globally numbered list. Volume-local
+    // numbering resets and ascending catalogs must retain their original order.
+    if (new Set(numbered.map((item) => item.ordinal)).size !== numbered.length) return chapters;
+    const descending = numbered.slice(1).filter((item, index) => item.ordinal! < numbered[index]!.ordinal!).length;
+    if (descending / (numbered.length - 1) >= 0.9) return [...chapters].reverse();
+    return chapters;
+  }
 
   // Mayi places a "latest chapters" block before the complete catalog. Stable
   // numeric ordering folds that prefix back into the actual chapter sequence.
@@ -322,6 +375,14 @@ function normalizeCatalogOrder(chapters: ChapterRef[], profile?: SiteProfile): C
   }).map((item) => item.chapter);
 }
 
+export function normalizeSavedCatalog(book: Book): Book {
+  if (book.kind !== 'online') return book;
+  const chapters = normalizeCatalogOrder(book.chapters, profileForUrl(book.source));
+  const author = cleanAuthor(book.author);
+  if (author === book.author && chapters.every((chapter, index) => chapter === book.chapters[index])) return book;
+  return { ...book, author, chapters };
+}
+
 function inferChapterAnchors($: CheerioAPI, baseUrl: string): ChapterRef[] {
   const chapters: ChapterRef[] = [];
   $('a[href]').each((_, anchor) => {
@@ -331,7 +392,7 @@ function inferChapterAnchors($: CheerioAPI, baseUrl: string): ChapterRef[] {
       return;
     }
     const url = resolveUrl($(anchor).attr('href'), baseUrl);
-    if (url) {
+    if (url && chapterLinkCompatible(url, baseUrl, title)) {
       chapters.push({ title, url });
     }
   });
@@ -339,19 +400,24 @@ function inferChapterAnchors($: CheerioAPI, baseUrl: string): ChapterRef[] {
 }
 
 function authorFromPage($: CheerioAPI, profile?: SiteProfile): string | undefined {
-  for (const selector of profile?.authorSelectors ?? []) {
-    const value = valueFromSelector($, selector).replace(/^(?:作\s*者|作者)[：:]?\s*/, '');
+  for (const selector of ['meta[property="og:novel:author"]', 'meta[name="og:novel:author"]', '[itemprop="author"]', 'a[rel="author"]']) {
+    const value = cleanAuthor(valueFromSelector($, selector));
     if (value) return value;
   }
-  const explicit = tidy($('[itemprop="author"],.author,.book-author').first().text()).replace(/^作者[：:]?\s*/, '');
+  for (const selector of profile?.authorSelectors ?? []) {
+    const value = cleanAuthor(valueFromSelector($, selector));
+    if (value) return value;
+  }
+  const explicit = cleanAuthor($('[itemprop="author"],.author,.book-author,.author-name').first().text());
   if (explicit) {
     return explicit;
   }
   for (const node of $('p').toArray().slice(0, 500)) {
     const text = tidy($(node).text());
-    const match = text.match(/(?:作\s*者|作者)[：:]?\s*(.+)/);
+    const match = text.match(/^\s*(?:作\s*者|作者)\s*[：:]\s*(.+)/);
     if (match?.[1]) {
-      return match[1].trim();
+      const value = cleanAuthor(match[1]);
+      if (value) return value;
     }
   }
   return undefined;
@@ -477,7 +543,8 @@ export function catalogPageUrls(html: string, url: string): string[] {
 
 function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): SearchResult[] {
   const results: SearchResult[] = [];
-  const isBookHref = (href: string) => !/\/(?:sort|category|class|blist|rank|top|search|tag|user|login)(?:\/|\.|\?)/i.test(href)
+  const isBookHref = (href: string) => !/\/(?:fenlei|genre|sort|category|class|blist|rank|top|search|tag|user|login)(?:\/|\.|\?)/i.test(href)
+    && !/\/list\d+\/\d+(?:\/|$)/i.test(href)
     && /(?:\/\d+[_/]\d*\/?$|\/(?:book|novel|info|shu|b)\/|\/onebook\.php\?novelid=|\/wiki\/|\/ebooks\/|\/\d+\/$)/i.test(href);
   $('.grid tr,table tr,.search-list li,.result-list li,.search-result-list li,.search-result-item,.search-tab li,.bookbox,.book-item,.newbox li,.book-img-text li,.bookinfo,.book,.book-li,.novel-item,.result-item').each((_, row) => {
     if (results.length >= 100) return false;
@@ -503,7 +570,7 @@ function parseSearchRows($: CheerioAPI, baseUrl: string, provider: string): Sear
       url,
       provider,
       latestChapter,
-      author: cells[2] || tidy($(row).find('.author').first().text()) || undefined
+      author: cleanAuthor(cells[2]) || cleanAuthor($(row).find('.author').first().text())
     });
   });
   if (results.length === 0) {
@@ -603,7 +670,7 @@ async function browserFallback<T>(
       return await renderedAttempt(html);
     } catch (error) {
       browserPreferredUntil.delete(preferenceKey);
-      if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
+      if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError || error instanceof RestrictedChapterError || error instanceof RateLimitedError) throw error;
       // Retry through the ordinary request path in case the site's behavior changed.
     }
   }
@@ -613,6 +680,7 @@ async function browserFallback<T>(
     browserPreferredUntil.delete(preferenceKey);
     return result;
   } catch (error) {
+    if (error instanceof RestrictedChapterError || error instanceof RateLimitedError) throw error;
     staticError = error;
   }
   if (options.browserRendering === false) throw staticError;
@@ -622,14 +690,20 @@ async function browserFallback<T>(
     browserPreferredUntil.set(preferenceKey, Date.now() + browserPreferenceLifetimeMs);
     return result;
   } catch (error) {
-    if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
+    if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError || error instanceof RestrictedChapterError || error instanceof RateLimitedError) throw error;
     throw new Error(`普通抓取失败：${errorMessage(staticError)}；浏览器渲染也失败：${errorMessage(error)}`);
   }
 }
 
 async function loadCatalogPage(url: string, options: FetchOptions, source?: NovelSource): Promise<{ html: string; catalog: ParsedCatalog }> {
-  const parse = (html: string) => ({ html, catalog: parseCatalogHtml(html, url, source) });
+  let effectiveUrl = url;
+  const parse = (html: string) => {
+    const catalog = parseCatalogHtml(html, effectiveUrl, source);
+    if (catalog.chapters.length === 0) throw new Error('未识别到有效目录，页面可能需要浏览器渲染或目录规则尚未适配。');
+    return { html, catalog };
+  };
   const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000),
+    onFinalUrl: (value: string) => { effectiveUrl = value; options.onFinalUrl?.(value); },
     ...(source ? { allowsUrl: (value: string) => sourceAllowsUrl(source, value) } : {}) };
   return browserFallback(url, limited, async () => parse(await fetchHtml(url, limited)), parse);
 }
@@ -677,8 +751,10 @@ async function loadChapterPage(
   options: FetchOptions,
   source?: NovelSource
 ): Promise<{ html: string; chapter: ChapterContent; page: ReturnType<typeof chapterPageState> }> {
-  const parse = (html: string) => parseLoadedChapterPage(html, url, options, source);
+  let effectiveUrl = url;
+  const parse = (html: string) => parseLoadedChapterPage(html, effectiveUrl, { ...options, onFinalUrl: undefined }, source);
   const limited = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000),
+    onFinalUrl: (value: string) => { effectiveUrl = value; options.onFinalUrl?.(value); },
     ...(source ? { allowsUrl: (value: string) => sourceAllowsUrl(source, value) } : {}) };
   return browserFallback(url, limited, async () => parse(await fetchHtml(url, { ...limited, referer: url })), parse);
 }
@@ -699,6 +775,7 @@ export async function searchBooks(
   options: FetchOptions,
   providerFilter?: string[]
 ): Promise<{ results: SearchResult[]; errors: string[] }> {
+  const nativeKeyword = siteSearchQuery(keyword);
   let providers: BuiltInSearchProvider[] = [
     ...filterSearchProviders(builtInSearchProviders, providerFilter),
     ...customProviders.map((provider) => ({ ...provider, kind: 'html' as const }))
@@ -712,7 +789,7 @@ export async function searchBooks(
     const batch = await Promise.all(providers.slice(offset, offset + 5).map(async (provider) => {
       const page = Math.min(Math.max(options.searchPage ?? 1, 1), 5);
       const cacheKey = `${provider.url}:${keyword}`;
-      let url = provider.url.replaceAll('{keyword}', encodeURIComponent(keyword)).replaceAll('{page}', String(page));
+      let url = provider.url.replaceAll('{keyword}', encodeURIComponent(nativeKeyword)).replaceAll('{page}', String(page));
       if (page > 1 && !provider.url.includes('{page}') && provider.kind !== 'zongheng') {
         const discovered = searchPages.get(cacheKey)?.get(page);
         if (!discovered) return [];
@@ -724,7 +801,7 @@ export async function searchBooks(
         const htmlOptions = { ...options, maxBytes: Math.min(options.maxBytes ?? 2_000_000, 2_000_000),
           method: provider.method, charset: provider.charset,
           form: provider.form ? Object.fromEntries(Object.entries(provider.form).map(([key, value]) =>
-            [key, value.replaceAll('{keyword}', keyword).replaceAll('{page}', String(page))])) : undefined,
+            [key, value.replaceAll('{keyword}', nativeKeyword).replaceAll('{page}', String(page))])) : undefined,
           onFinalUrl: (value: string) => { effectiveUrl = value; } };
         let parsedResults: SearchResult[] = [];
         const parse = (value: string) => {
@@ -744,6 +821,7 @@ export async function searchBooks(
           : await fetchHtml(url, htmlOptions);
         if (provider.kind === 'mediawiki') parsedResults = parseMediaWikiSearch(html, provider);
         if (provider.kind === 'zongheng') parsedResults = parseZonghengSearch(html, provider);
+        parsedResults = relevantSearchResults(parsedResults, keyword);
         const next = provider.kind === 'html' ? searchNextPageUrl(html, effectiveUrl) : undefined;
         if (next) {
           if (searchPages.size >= 100) searchPages.delete(searchPages.keys().next().value!);
@@ -779,6 +857,7 @@ export async function loadCatalog(url: string, options: FetchOptions, source?: N
   const maxPages = Math.min(Math.max(profile.maxCatalogPages ?? 20, 1), 100);
   const appendPage = (html: string, pageUrl: string) => {
     const pageCatalog = parseCatalogHtml(html, pageUrl);
+    if (pageCatalog.chapters.length === 0) throw new Error(`目录分页未识别到章节：${pageUrl}`);
     chapters.push(...pageCatalog.chapters);
     for (const discovered of catalogPageUrls(html, pageUrl)) {
       if (!visited.has(discovered) && !queue.includes(discovered)) queue.push(discovered);
@@ -890,10 +969,13 @@ async function loadChapterPageBatch(
   if (!browserIsPreferred(urls[0] ?? 'https://invalid.invalid')) {
     try {
       return await Promise.all(urls.map(async (pageUrl) => {
-        const html = await fetchHtml(pageUrl, { ...limited, referer: pageUrl });
-        return parseLoadedChapterPage(html, pageUrl, limited);
+        let effectiveUrl = pageUrl;
+        const html = await fetchHtml(pageUrl, { ...limited, referer: pageUrl,
+          onFinalUrl: (value) => { effectiveUrl = value; options.onFinalUrl?.(value); } });
+        return parseLoadedChapterPage(html, effectiveUrl, { ...limited, onFinalUrl: undefined });
       }));
     } catch (error) {
+      if (error instanceof RestrictedChapterError || error instanceof RateLimitedError) throw error;
       if (options.browserRendering === false) throw error;
     }
   }
@@ -906,7 +988,7 @@ async function loadChapterPageBatch(
       return parseLoadedChapterPage(html, pageUrl, limited);
     }));
   } catch (error) {
-    if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError) throw error;
+    if (error instanceof BrowserVerificationRequiredError || error instanceof BrowserAutomationBlockedError || error instanceof RestrictedChapterError || error instanceof RateLimitedError) throw error;
     const pages = [];
     for (const pageUrl of urls) pages.push(await loadChapterPage(pageUrl, options));
     return pages;
@@ -963,7 +1045,14 @@ export async function loadChapter(url: string, options: FetchOptions, source?: N
     if (visited.has(pageUrl)) throw new Error('章节分页形成了循环，已停止读取。');
     visited.add(pageUrl);
     options.onProgress?.(`正在读取正文分页 ${pageCount + 1}${current.page.total ? ` / ${current.page.total}` : ''}`);
-    current = await loadChapterPage(pageUrl, options);
+    const next = await loadChapterPage(pageUrl, options);
+    if (!first.page.total && next.chapter.title !== first.chapter.title) {
+      // Some sites call chapter navigation "下一页". Do not merge a different
+      // chapter into this one or keep following it until the pagination cap.
+      return { ...first.chapter, content: contents.join('\n\n'), nextUrl: pageUrl,
+        catalogUrl: first.chapter.catalogUrl ?? current.chapter.catalogUrl };
+    }
+    current = next;
     contents.push(current.chapter.content);
   }
   if (current.page.nextPageUrl) throw new Error('单章超过 20 个网页分页，已停止读取。');

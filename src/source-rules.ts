@@ -5,8 +5,10 @@ import type { AnyNode } from 'domhandler';
 import { loadCatalog, loadChapter, parseCatalogHtml, parseChapterHtml, searchNextPageUrl } from './adapters';
 import { BrowserVerificationRequiredError, renderHtmlWithBrowser } from './browser';
 import { NovelSource, ParsedCatalog, SearchResult } from './model';
-import { assertSafeRemoteUrl, FetchOptions, fetchHtml, resolveUrl } from './net';
+import { assertSafeRemoteUrl, FetchOptions, fetchHtml, resolveUrl, RateLimitedError } from './net';
 import { sourceAllowsUrl } from './source-policy';
+import { cleanAuthor } from './book-metadata';
+import { relevantSearchResults, siteSearchQuery } from './search-utils';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -160,7 +162,7 @@ export function parseSourceSearchHtml(html: string, baseUrl: string, source: Nov
       url,
       provider: source.name,
       sourceId: source.id,
-      author: source.search!.authorSelector ? scoped(scope, source.search!.authorSelector).text().replace(/\s+/g, ' ').trim() || undefined : undefined,
+      author: source.search!.authorSelector ? cleanAuthor(scoped(scope, source.search!.authorSelector).text()) : undefined,
       latestChapter: source.search!.latestChapterSelector
         ? scoped(scope, source.search!.latestChapterSelector).text().replace(/\s+/g, ' ').trim() || undefined
         : undefined
@@ -182,6 +184,7 @@ async function sourcePageHtml(
     validate(html);
     return html;
   } catch (error) {
+    if (error instanceof RateLimitedError) throw error;
     staticError = error;
   }
   if (options.browserRendering === false || options.method === 'POST') throw staticError;
@@ -202,6 +205,7 @@ export async function searchNovelSources(
   sources: NovelSource[],
   options: FetchOptions
 ): Promise<{ results: SearchResult[]; errors: string[] }> {
+  const nativeKeyword = siteSearchQuery(keyword);
   const errors: string[] = [];
   const enabled = sources.filter((source) => source.enabled && source.search).slice(0, 50);
   const results: SearchResult[] = [];
@@ -211,7 +215,7 @@ export async function searchNovelSources(
     const batch = await Promise.all(enabled.slice(offset, offset + 5).map(async (source) => {
       const page = Math.min(Math.max(options.searchPage ?? 1, 1), 5);
       const key = `${source.id}:${keyword}`;
-      let url = source.search!.url.replace(/\{\{?keyword\}?\}/g, encodeURIComponent(keyword)).replace(/\{\{?page\}?\}/g, String(page));
+      let url = source.search!.url.replace(/\{\{?keyword\}?\}/g, encodeURIComponent(nativeKeyword)).replace(/\{\{?page\}?\}/g, String(page));
       if (page > 1 && !/\{\{?page\}?\}/.test(source.search!.url)) {
         const discovered = customSearchPages.get(key)?.get(page);
         if (!discovered) return [];
@@ -222,14 +226,14 @@ export async function searchNovelSources(
         let effectiveUrl = url;
         const searchOptions = { ...options, method: source.search!.method, charset: source.search!.charset,
           form: source.search!.form ? Object.fromEntries(Object.entries(source.search!.form).map(([key, value]) =>
-            [key, value.replace(/\{\{?keyword\}?\}/g, () => keyword).replace(/\{\{?page\}?\}/g, String(page))])) : undefined,
+            [key, value.replace(/\{\{?keyword\}?\}/g, () => nativeKeyword).replace(/\{\{?page\}?\}/g, String(page))])) : undefined,
           allowsUrl: (value: string) => sourceAllowsUrl(source, value),
           onFinalUrl: (value: string) => { effectiveUrl = value; } };
         const html = await sourcePageHtml(url, searchOptions, (value) => {
           parsed = parseSourceSearchHtml(value, effectiveUrl, source);
           if (parsed.length === 0) throw new Error('搜索页没有匹配书源规则。');
         });
-        const results = parsed.length ? parsed : parseSourceSearchHtml(html, url, source);
+        const results = relevantSearchResults(parsed.length ? parsed : parseSourceSearchHtml(html, effectiveUrl, source), keyword);
         const next = searchNextPageUrl(html, effectiveUrl, source.search!.nextPageSelector);
         if (next && sourceAllowsUrl(source, next)) {
           if (customSearchPages.size >= 100) customSearchPages.delete(customSearchPages.keys().next().value!);

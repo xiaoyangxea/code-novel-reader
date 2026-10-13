@@ -36,6 +36,9 @@ export interface SearchResult {
   title: string;
   author?: string;
   latestChapter?: string;
+  summary?: string;
+  kind?: 'book' | 'author-index';
+  authorInferred?: boolean;
   url: string;
   provider: string;
   sourceId?: string;

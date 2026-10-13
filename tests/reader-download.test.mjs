@@ -56,6 +56,25 @@ test('boss mode shows the saved snapshot, keeps chapter prefetch running, and re
   await reader.dispose();
 });
 
+test('opening an old reversed catalog preserves the current chapter by URL after correcting its order', async () => {
+  ui.configuration = { prefetchNextChapter: false };
+  const reversed = { ...book, source: 'https://book.qq.com/book-chapter/1',
+    chapters: [3, 2, 1].map((i) => ({ title: `第${i}章`, url: `https://book.qq.com/book-read/1/${i}` })) };
+  const saved = { chapterIndex: 0, pageIndex: 0, updatedAt: 123 };
+  const stored = [];
+  const repository = { getProgress: () => ({ ...saved }), saveProgress: async (_, progress) => stored.push({ ...progress }), saveBook: async () => undefined };
+  let requested;
+  const chapters = { allowBook() {}, get: async (current, index) => {
+    requested = current.chapters[index].url; return { title: current.chapters[index].title, content: '原创测试内容。'.repeat(40), url: requested };
+  } };
+  const reader = new ReaderController(repository, new ReaderDocumentProvider(), {}, context(), chapters);
+  await reader.openBook(reversed);
+  assert.equal(requested, 'https://book.qq.com/book-read/1/3');
+  assert.equal(stored[0].chapterIndex, 2);
+  assert.equal(reversed.chapters[0].title, '第3章');
+  await reader.dispose();
+});
+
 test('custom boss snapshots are saved as text and oversized content is rejected', async () => {
   const ctx = context();
   window.activeTextEditor = { document: { uri: Uri.parse('untitled:work.ts'), getText: () => 'function work() {\n  return 1;\n}' } };

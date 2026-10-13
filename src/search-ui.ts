@@ -7,7 +7,8 @@ import { SearchProviderConfig, SearchResult } from './model';
 import { SourceRepository } from './repository';
 import { searchNovelSources } from './source-rules';
 import { siteProfiles } from './sites';
-import { groupSearchResults, sourceFailureLabel } from './search-utils';
+import { groupSearchResults, relevantSearchResults, matchesSearchKeyword, rankedSearchCandidates, searchMatchLabel, sourceFailureLabel } from './search-utils';
+import { expandAuthorIndexes } from './search-expansion';
 import { publicWebSearch } from './web-search';
 
 interface Item extends vscode.QuickPickItem { results?: SearchResult[]; action?: 'more' | 'discovery' | 'public' | 'status'; }
@@ -21,12 +22,12 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
   const mine = sources.getSources().filter((source) => source.enabled && source.search);
   const legacy = vscode.workspace.getConfiguration('codeNovel').get<SearchProviderConfig[]>('searchProviders', []);
   const selected = await vscode.window.showQuickPick([
-    { label: '聚合书源 + 全网搜索', description: '内置、自定义来源及 Bing、DuckDuckGo；搜索词会发送给这些服务', mode: 'combined', names: profiles.map((p) => p.search!.name) },
+    { label: '聚合书源 + 全网搜索', description: '内置、自定义来源及 Bing、DuckDuckGo、百度；搜索词会发送给这些服务', mode: 'combined', names: profiles.map((p) => p.search!.name) },
     { label: '全部已启用书源', mode: 'all', names: profiles.map((p) => p.search!.name) },
     { label: '公共/内置来源', mode: 'builtin', names: profiles.map((p) => p.search!.name) },
     { label: '我的书源', mode: 'custom', names: [] },
     { label: '网络发现（Brave API）', mode: 'discovery', names: [] },
-    { label: '全网搜索（Bing + DuckDuckGo，无需 Key）', description: '搜索词会发送给两个引擎，可直接在插件内导入发现的目录', mode: 'public', names: [] },
+    { label: '全网搜索（Bing + DuckDuckGo + 百度，无需 Key）', description: '搜索词会发送给三个引擎，可直接在插件内导入发现的目录', mode: 'public', names: [] },
     ...profiles.map((p) => ({ label: p.name, mode: 'builtin-one', names: [p.search!.name] })),
     ...mine.map((p) => ({ label: p.name, mode: 'custom-one', names: [p.id] }))
   ], { title: '选择搜索来源' });
@@ -51,24 +52,25 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
     if (!alive) return;
     picker.items = [
       ...groupSearchResults(results, keyword).map((group) => ({ label: group[0]!.title,
-        description: `${group[0]!.author ?? ''} · ${group.length} 个来源`,
-        detail: group.map((r) => `${r.provider}${r.catalogStatus === 'verified' ? '（目录已识别）' : r.catalogStatus === 'verification' ? '（需要验证）' : ''}`).join(' · '), results: group })),
+        description: `${group[0]!.author ?? ''}${group[0]!.authorInferred ? '（作者页候选）' : ''} · ${group.length} 个来源`,
+        detail: `${searchMatchLabel(group[0]!, keyword)} · ${group.map((r) => `${r.provider}${r.catalogStatus === 'verified' ? '（目录已识别，正文未验证）' : r.catalogStatus === 'verification' ? '（需要验证）' : r.catalogStatus === 'unverified' ? '（网页候选，待验证）' : ''}`).join(' · ')}`, results: group })),
       ...(!busy && more.size && page < 5 ? [{ label: '$(add) 加载更多站内结果', action: 'more' as const }] : []),
       { label: '$(globe) 扩大搜索范围（Brave API）', action: 'discovery' },
-      ...(publicPage < 3 ? [{ label: '$(search) 全网补搜（Bing + DuckDuckGo）', action: 'public' as const }] : []),
+      ...(publicPage < 3 ? [{ label: '$(search) 全网补搜（Bing + DuckDuckGo + 百度）', action: 'public' as const }] : []),
       { label: `$(info) 来源状态（${statuses.size}）`, description: busy ? '搜索中…' : `${results.length} 条结果`, action: 'status' }
     ];
     picker.busy = busy;
   };
   const batch = (items: SearchResult[], provider: string, error?: string, hasMore?: boolean) => {
     if (!alive) return;
-    for (const result of items) if (!results.some((r) => r.url === result.url)) results.push(result);
-    statuses.set(provider, error ? sourceFailureLabel(error) : `${items.length} 条结果${hasMore ? '，有后续分页' : ''}`);
+    const related = relevantSearchResults(items, keyword);
+    for (const result of related) if (!results.some((r) => r.url === result.url)) results.push(result);
+    statuses.set(provider, error ? sourceFailureLabel(error) : `${related.length} 条相关结果${items.length > related.length ? `（过滤 ${items.length - related.length} 条无关结果）` : ''}${hasMore ? '，有后续分页' : ''}`);
     if (hasMore && provider !== '网络发现' && !provider.startsWith('全网')) more.add(provider); else more.delete(provider);
     update();
   };
   const probe = async (items: SearchResult[]) => {
-    const candidates = items.slice(0, 8);
+    const candidates = rankedSearchCandidates(items, keyword, 8);
     let cursor = 0;
     const worker = async () => {
       while (alive && cursor < candidates.length) {
@@ -79,9 +81,10 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
             ...options, timeoutMs: Math.min(options.timeoutMs, 5000), browserRendering: false
           });
           if (!alive) return;
-          if (catalog.chapters.length >= 2) {
+          if (catalog.chapters.length >= 2 && matchesSearchKeyword({ title: catalog.title, author: catalog.author, url: item.url, provider: item.provider }, keyword)) {
             item.title = catalog.title;
             item.author = catalog.author;
+            item.authorInferred = false;
             item.chapterCount = catalog.chapters.length;
             item.catalogStatus = 'verified';
           }
@@ -104,7 +107,8 @@ export async function searchOnlineUI(context: vscode.ExtensionContext, sources: 
         if (!await hasDiscoveryKey(context) || !alive) return;
         if (discoveryPage >= 5) { statuses.set('网络发现', '已达到本次补搜 5 页上限'); return; }
         discoveryPage += 1;
-        const items = await discoverBooks(context, keyword, { ...options, searchPage: discoveryPage });
+        const items = await expandAuthorIndexes(await discoverBooks(context, keyword, { ...options, searchPage: discoveryPage }), keyword, options);
+        batch(items, '网络发现');
         await probe(items);
       } else if (mode === 'public') {
         if (publicPage >= 3) return;

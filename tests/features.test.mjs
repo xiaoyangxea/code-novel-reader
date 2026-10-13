@@ -19,6 +19,22 @@ function service(loader) {
 }
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test('old cached QQ excerpts are reloaded, and a rejected restricted chapter cannot overwrite the cache', async () => {
+  const url = 'https://book.qq.com/book-read/695233/89';
+  const qqBook = { ...book, chapters: [{ title: '第89章', url }] };
+  let cached = { title: '第89章', url, content: '这是测试摘要。'.repeat(20) + '...' };
+  let requested = 0;
+  let writes = 0;
+  const chapters = new ChapterService({ getBook: () => qqBook, readCachedChapter: async () => cached,
+    cacheChapter: async (_, value) => { writes++; cached = value; } },
+    () => ({ timeoutMs: 1000, userAgent: 'test' }), () => undefined, async () => {
+      requested++; throw new core.RestrictedChapterError();
+    });
+  await assert.rejects(chapters.get(qqBook, 0), core.RestrictedChapterError);
+  assert.equal(requested, 1);
+  assert.equal(writes, 0);
+});
+
 test('foreground chapters are promoted ahead of pending downloads, without duplicate loads', async () => {
   let release;
   const order = [];

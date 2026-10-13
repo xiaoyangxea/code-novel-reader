@@ -5,6 +5,7 @@ import { maxLocalBookBytes, parseEpub, ParsedLocalBook, parsePlainText } from '.
 import { Book, ChapterContent, ReadingProgress } from './model';
 import { BookRepository, SourceRepository } from './repository';
 import { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
+import { normalizeSavedCatalog } from './adapters';
 
 export class ReaderDocumentProvider implements vscode.TextDocumentContentProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
@@ -179,10 +180,24 @@ export class ReaderController {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `正在打开《${book.title}》...` },
       async (progress) => {
+        const originalBook = book;
+        const saved = { ...this.repository.getProgress(book.id) };
+        const currentUrl = book.chapters[saved.chapterIndex]?.url;
+        book = normalizeSavedCatalog(book);
+        if (book !== originalBook && saved.updatedAt > 0 && currentUrl) {
+          const migrated = book.chapters.findIndex((chapter) => chapter.url === currentUrl);
+          if (migrated >= 0) saved.chapterIndex = migrated;
+        }
         this.activeBook = book;
         this.bossMode = false;
         if (parsedLocal && book.kind !== 'online') this.rememberLocalBook(book.id, parsedLocal);
-        this.progress = this.repository.getProgress(book.id);
+        this.progress = saved;
+        if (book !== originalBook) {
+          await this.repository.saveBook(book);
+          if (this.activeBook !== book) return;
+          await this.repository.saveProgress(book.id, saved);
+          if (this.activeBook !== book) return;
+        }
         if (book.kind !== 'online') {
           await this.parseLocal(book);
         }

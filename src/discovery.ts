@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { Dispatcher, fetch as undiciFetch, ProxyAgent } from 'undici';
 import { SearchResult } from './model';
 import { FetchOptions, readBodyLimited } from './net';
+import { webSearchQuery } from './web-search';
+import { isLikelyBookCandidate, isSearchNoise } from './search-utils';
 
 const braveKeyName = 'codeNovel.braveSearchApiKey';
 
@@ -52,10 +54,9 @@ export async function discoverBooks(
   if (!apiKey) throw new Error('尚未配置 Brave Search API Key，请先打开“书源管理 → 网络发现设置”。');
   const endpoint = new URL('https://api.search.brave.com/res/v1/web/search');
   const page = Math.min(Math.max(options.searchPage ?? 1, 1), 5);
-  const queries = [`${keyword} 小说 目录`, `"${keyword}" 在线阅读`, `${keyword} 小说 全部章节`];
-  endpoint.searchParams.set('q', queries[(page - 1) % queries.length]!);
+  endpoint.searchParams.set('q', webSearchQuery(keyword, ((page - 1) % 3) + 1));
   endpoint.searchParams.set('count', '20');
-  endpoint.searchParams.set('offset', String(Math.floor((page - 1) / queries.length)));
+  endpoint.searchParams.set('offset', String(Math.floor((page - 1) / 3)));
   endpoint.searchParams.set('search_lang', 'zh-hans');
   endpoint.searchParams.set('safesearch', 'moderate');
   const proxyUrl = options.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
@@ -102,9 +103,10 @@ export async function discoverBooks(
         title: item.title.replace(/<[^>]+>/g, ''),
         url: item.url,
         provider: `网络发现 · ${domain}`,
-        latestChapter: item.description?.replace(/<[^>]+>/g, '')
+        latestChapter: item.description?.replace(/<[^>]+>/g, ''),
+        summary: item.description?.replace(/<[^>]+>/g, '')
       }];
-    });
+    }).filter((item) => isLikelyBookCandidate(item) && !isSearchNoise(item));
     options.onSearchBatch?.(results, '网络发现', undefined, Boolean(data.query?.more_results_available) && page < 5);
     return results;
   } catch (error) {

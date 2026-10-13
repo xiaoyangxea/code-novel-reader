@@ -42,6 +42,16 @@ function parentDirectory(url: URL): string | undefined {
 
 export const siteProfiles: SiteProfile[] = [
   {
+    id: 'qq-public', name: 'QQ 阅读（公开章节）', hosts: /^(?:book|ubook\.reader)\.qq\.com$/i,
+    contentSelectors: ['#article', '.chapter-content'], catalogSelectors: ['.chapter-list', '#chapter-list'],
+    chapterTitleSelectors: ['h1', '.chapter-title'], bookTitleSelectors: ['meta[property="og:novel:book_name"]', 'h1'],
+    authorSelectors: ['meta[property="og:novel:author"]', '.author'], sortCatalogByOrdinal: true,
+    inferCatalogUrl: (url) => {
+      const match = url.pathname.match(/^\/book-(?:read|chapter)\/(\d+)(?:\/|$)/);
+      return match ? `https://book.qq.com/book-chapter/${match[1]}` : undefined;
+    }
+  },
+  {
     id: 'shoujix', name: '手机小说', hosts: /(?:^|\.)shoujix\.com$/i,
     contentSelectors: ['#content', '.chapter-content'], catalogSelectors: ['#list', '.listmain', '.chapter-list'],
     chapterTitleSelectors: ['.bookname h1', 'h1'], bookTitleSelectors: ['#info h1', 'h1'],

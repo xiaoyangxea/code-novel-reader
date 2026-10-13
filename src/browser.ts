@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { access, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -159,7 +159,6 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<{ code: nu
   return new Promise((resolve, reject) => {
     let stderr = '';
     const timer = setTimeout(() => {
-      child.kill();
       reject(new Error(`浏览器渲染超时（${timeoutMs}ms）。`));
     }, timeoutMs);
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -185,11 +184,30 @@ function hasDesktopSession(): boolean {
     || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
 }
 
+const browserStops = new WeakMap<ChildProcess, Promise<void>>();
+
+export function ownedBrowserTerminationArguments(pid: number): string[] {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('无效的专用浏览器进程 ID。');
+  return ['/PID', String(pid), '/T', '/F'];
+}
+
 async function stopOwnedBrowser(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.killed) return;
-  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
-  child.kill();
-  await Promise.race([exited, delay(2000)]);
+  const pending = browserStops.get(child);
+  if (pending) return pending;
+  const stopped = (async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    // This ChildProcess was created by the current reading task. Never kill by
+    // browser name or terminate an independently opened verification window.
+    if (process.platform === 'win32' && child.pid) {
+      await new Promise<void>((resolve) => execFile('taskkill.exe', ownedBrowserTerminationArguments(child.pid!),
+        { windowsHide: true, timeout: 2000 }, () => resolve()));
+    }
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await Promise.race([exited, delay(2000)]);
+  })();
+  browserStops.set(child, stopped);
+  return stopped;
 }
 
 async function renderHeadlessHtml(
@@ -215,12 +233,15 @@ async function renderHeadlessHtml(
     total += chunk.length;
     if (total > renderedLimit) {
       overflow = true;
-      child.kill();
+      void stopOwnedBrowser(child);
       return;
     }
     chunks.push(Buffer.from(chunk));
   });
-  const { code, stderr } = await waitForExit(child, timeoutMs);
+  let code: number | null;
+  let stderr: string;
+  try { ({ code, stderr } = await waitForExit(child, timeoutMs)); }
+  finally { await stopOwnedBrowser(child); }
   if (overflow) throw new Error(`浏览器渲染后的页面超过 ${Math.ceil(renderedLimit / 1_000_000)} MB，已停止读取。`);
   const html = Buffer.concat(chunks, total).toString('utf8');
   if (isBrowserChallengeHtml(html)) throw new BrowserVerificationRequiredError(safeUrl);

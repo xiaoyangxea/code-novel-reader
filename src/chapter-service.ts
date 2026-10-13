@@ -1,6 +1,7 @@
 import { loadChapter } from './adapters';
 import { Book, ChapterContent, NovelSource } from './model';
 import { FetchOptions } from './net';
+import { isSuspectedCachedExcerpt } from './chapter-quality';
 
 export class BackgroundTaskCancelled extends Error {}
 
@@ -37,7 +38,7 @@ export class ChapterService {
     if (!reference) throw new Error('章节不存在。');
     if (!force) {
       const cached = await this.cache.readCachedChapter(book.id, reference.url);
-      if (cached) return cached;
+      if (cached && !isSuspectedCachedExcerpt(cached)) return cached;
     }
     const key = `${book.id}:${reference.url}${force ? ':force' : ''}`;
     const existing = this.pending.get(key);

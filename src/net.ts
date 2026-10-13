@@ -6,6 +6,10 @@ import type { SearchResult } from './model';
 import { effectiveProxy } from './proxy';
 
 const maxResponseBytes = 8_000_000;
+const requestCooldowns = new Map<string, number>();
+export class RateLimitedError extends Error {
+  constructor(message: string) { super(message); this.name = 'RateLimitedError'; }
+}
 const blockedAddresses = new BlockList();
 for (const [network, prefix] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
@@ -195,6 +199,15 @@ async function download(
         ...(options.method === 'POST' ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {})
       }
     });
+    if (response.status === 429) {
+      const retry = response.headers.get('retry-after') ?? '';
+      const requested = /^\d+$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry) - Date.now();
+      const delay = Number.isFinite(requested) ? Math.min(Math.max(requested, 1000), 300_000) : 60_000;
+      if (requestCooldowns.size >= 128) requestCooldowns.delete(requestCooldowns.keys().next().value!);
+      requestCooldowns.set(new URL(logicalUrl).origin, Date.now() + delay);
+      await response.body?.cancel();
+      throw new RateLimitedError(`HTTP 429：站点限制请求频率，将暂停该来源 ${Math.ceil(delay / 1000)} 秒。`);
+    }
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) throw new Error(`HTTP ${response.status} 缺少重定向地址`);
@@ -209,6 +222,7 @@ async function download(
     const bytes = await readBodyLimited(response, Math.min(options.maxBytes ?? maxResponseBytes, maxResponseBytes), '网页响应');
     return { bytes, contentType: response.headers.get('content-type') };
   } catch (error) {
+    if (error instanceof RateLimitedError) throw error;
     if (error instanceof Error && error.name === 'AbortError') {
       throw new Error(`请求超时（${options.timeoutMs}ms）: ${logicalUrl}`);
     }
@@ -310,6 +324,9 @@ export async function fetchHtml(url: string, options: FetchOptions): Promise<str
   for (let redirect = 0; redirect <= 5; redirect += 1) {
     if (options.allowsUrl && !options.allowsUrl(currentUrl)) throw new Error('请求被书源声明的域名范围拒绝。');
     const target = validateRemoteTarget(currentUrl);
+    const cooldown = requestCooldowns.get(target.origin) ?? 0;
+    if (cooldown > Date.now()) throw new RateLimitedError(`该来源正在限流冷却，请在 ${Math.ceil((cooldown - Date.now()) / 1000)} 秒后重试。`);
+    requestCooldowns.delete(target.origin);
     const address = await resolvePublicAddress(target, Math.max(deadline - Date.now(), 1), proxyUrl);
     let dispatcher: Dispatcher;
     let requestUrl = currentUrl;

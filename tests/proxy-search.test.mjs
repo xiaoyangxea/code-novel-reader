@@ -101,6 +101,51 @@ test('Clash detection reads only a top-level valid proxy port', () => {
   assert.equal(core.isBlockedNetworkAddress('2001:2::56'), true);
 });
 
+test('HTTP 429 cools down only the affected origin without repeating requests or disabling other sources', async () => {
+  const authorities = [];
+  const upstream = await localServer();
+  upstream.server.on('connect', (request, socket) => {
+    authorities.push(request.url);
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.once('data', () => socket.end(request.url.startsWith('93.184.216.34:')
+      ? 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+      : 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok'));
+  });
+  const options = { timeoutMs: 1000, userAgent: 'test', proxy: upstream.url };
+  try {
+    await assert.rejects(core.fetchHtml('http://93.184.216.34/search', options), core.RateLimitedError);
+    await assert.rejects(core.fetchHtml('http://93.184.216.34/book/1', options), /限流冷却/);
+    assert.equal(authorities.length, 1);
+    assert.equal(await core.fetchHtml('http://93.184.216.35/search', options), 'ok');
+    assert.equal(authorities.length, 2);
+  } finally { await upstream.close(); }
+});
+
+test('author index expansion has a shared two-request budget and does not follow private or cross-origin book links', async () => {
+  let calls = 0;
+  const upstream = await localServer();
+  upstream.server.on('connect', (_, socket) => {
+    calls += 1;
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.once('data', () => {
+      const body = '<h1>唐家三少</h1><ul class="search-list"><li><a href="/book/1/">斗罗大陆</a></li><li><a href="http://127.0.0.1/book/1/">坏链接</a></li></ul>';
+      socket.end('HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ' + Buffer.byteLength(body) + '\r\nConnection: close\r\n\r\n' + body);
+    });
+  });
+  const index = (address) => ({ title: '唐家三少的全部作品', url: `http://${address}/author/tang/`, provider: 'test', kind: 'author-index' });
+  try {
+    const options = { timeoutMs: 1000, userAgent: 'test', proxy: upstream.url };
+    const budget = { remaining: 2 };
+    const results = await core.expandAuthorIndexes(['93.184.216.36', '93.184.216.37', '93.184.216.38'].map(index), '唐家三少', options, budget);
+    assert.equal(calls, 2);
+    assert.equal(results.length, 2);
+    assert.ok(results.every((item) => item.title === '斗罗大陆'));
+    assert.equal(budget.remaining, 0);
+    assert.deepEqual(await core.expandAuthorIndexes([index('93.184.216.38')], '唐家三少', { ...options, shouldContinue: () => false }), []);
+    assert.equal(calls, 2);
+  } finally { await upstream.close(); }
+});
+
 test('source status distinguishes local connectivity, TLS, verification and parsing failures', () => {
   assert.match(core.sourceFailureLabel('UNABLE_TO_GET_ISSUER_CERT_LOCALLY'), /^证书校验失败/);
   assert.match(core.sourceFailureLabel('UND_ERR_CONNECT_TIMEOUT'), /^网络或代理连接失败/);
