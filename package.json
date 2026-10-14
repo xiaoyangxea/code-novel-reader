@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",

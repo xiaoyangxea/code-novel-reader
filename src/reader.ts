@@ -7,7 +7,7 @@ import { BookRepository, SourceRepository } from './repository';
 import { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReaderLayout } from './renderer';
 import { normalizeSavedCatalog } from './adapters';
 import { readingTemplate, readingTemplates } from './reading-templates';
-import { ReadingTemplateSelector, readingTemplateMode, templateStateKey } from './template-selection';
+import { ReadingTemplateSelector, readingTemplateMode, templateStateKey, bossTemplateStateKey } from './template-selection';
 
 export class ReaderDocumentProvider implements vscode.TextDocumentContentProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
@@ -44,6 +44,9 @@ export class ReaderController {
   private readonly templates: ReadingTemplateSelector;
   private templateWrite: Promise<void> = Promise.resolve();
   private savedTemplateRevision = 0;
+  private readonly bossTemplates: ReadingTemplateSelector;
+  private bossTemplateId: string;
+  private savedBossTemplateRevision = 0;
 
   constructor(
     private readonly repository: BookRepository,
@@ -54,6 +57,8 @@ export class ReaderController {
     private readonly onError?: (error: unknown) => void | Promise<void>
   ) {
     this.templates = new ReadingTemplateSelector(context.globalState.get(templateStateKey));
+    this.bossTemplates = new ReadingTemplateSelector(context.globalState.get(bossTemplateStateKey));
+    this.bossTemplateId = readingTemplate(this.bossTemplates.snapshot().last).id;
   }
 
   private rememberLocalBook(bookId: string, parsed: ParsedLocalBook): void {
@@ -244,12 +249,10 @@ export class ReaderController {
 
   private render(): void {
     this.updateNavigationContext();
-    if (!this.activeBook || !this.chapter) {
-      this.provider.update(this.bossContent());
-      return;
-    }
-    if (this.bossMode) {
-      this.provider.update(this.bossContent());
+    if (!this.activeBook || !this.chapter || this.bossMode) {
+      const content = this.getBossContent();
+      this.provider.update(content);
+      void this.revealReadingArea(content, 0, this.bossMode);
       return;
     }
     const config = this.config();
@@ -331,11 +334,11 @@ export class ReaderController {
     this.navigationContext = next;
   }
 
-  private async revealReadingArea(expectedContent: string, bodyLine: number): Promise<void> {
+  private async revealReadingArea(expectedContent: string, bodyLine: number, expectedBossMode = false): Promise<void> {
     const revision = ++this.revealRevision;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20));
-      if (revision !== this.revealRevision || !this.editor || this.bossMode) return;
+      if (revision !== this.revealRevision || !this.editor || this.bossMode !== expectedBossMode) return;
       if (this.editor.document.getText() !== expectedContent) continue;
       const line = Math.min(bodyLine, Math.max(this.editor.document.lineCount - 1, 0));
       const position = new vscode.Position(line, 0);
@@ -490,14 +493,34 @@ export class ReaderController {
 
   toggleBoss(): void {
     this.bossMode = !this.bossMode;
+    if (this.bossMode) this.rotateDefaultBossTemplate();
     this.render();
   }
 
-  private bossContent(): string {
-    return this.context.globalState.get<string>('codeNovel.bossContent') ?? renderBoss();
+  getBossContent(): string {
+    return this.context.globalState.get<string>('codeNovel.bossContent') ?? renderBoss(this.bossTemplateId);
   }
 
-  refreshBossContent(): void { if (this.bossMode || !this.activeBook) this.render(); }
+  private rotateDefaultBossTemplate(): void {
+    // A saved snapshot (including an empty string) must never be replaced by random code.
+    if (this.context.globalState.get<string>('codeNovel.bossContent') != null) return;
+    this.bossTemplateId = this.bossTemplates.change('', '', 'fixed', undefined, this.bossTemplateId);
+    if (this.savedBossTemplateRevision === this.bossTemplates.revision) return;
+    const revision = this.bossTemplates.revision;
+    this.savedBossTemplateRevision = revision;
+    const snapshot = this.bossTemplates.snapshot();
+    this.templateWrite = this.templateWrite.catch(() => undefined)
+      .then(() => this.context.globalState.update(bossTemplateStateKey, snapshot));
+    void this.templateWrite.catch((error) => {
+      if (this.savedBossTemplateRevision === revision) this.savedBossTemplateRevision = -1;
+      this.reportBackgroundError(error);
+    });
+  }
+
+  refreshBossContent(): void {
+    this.rotateDefaultBossTemplate();
+    if (this.bossMode || !this.activeBook) this.render();
+  }
 
   forgetBook(id: string): void {
     this.templates.forget(id);

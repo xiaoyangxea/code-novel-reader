@@ -3,6 +3,7 @@ import { readingTemplate, readingTemplates } from './reading-templates';
 
 export type ReadingTemplateMode = 'chapter' | 'book' | 'fixed';
 export const templateStateKey = 'codeNovel.readingTemplates.v1';
+export const bossTemplateStateKey = 'codeNovel.bossTemplates.v1';
 const maxBooks = 100;
 const maxChapters = 64;
 const ids = new Set(readingTemplates.map((item) => item.id));

@@ -133,28 +133,20 @@ void pipeline;\n`;
     bodyLine: prefix.split('\n').length - 1, templateId: template.id };
 }
 
-export function renderBoss(): string {
-  return `import type { CancellationToken, DiagnosticCollection, TextDocument } from 'vscode';
+export function renderBoss(templateId?: string): string {
+  const template = readingTemplate(templateId);
+  // No book, chapter or page text enters this path, even when reading metadata is visible.
+  return `/* eslint-disable @typescript-eslint/no-unused-vars */
+const pipeline = {
+  name: ${safeCodeString(template.id)},
+  stage: 'validation',
+  revision: 1,
+  offset: 0
+} as const;
 
-export interface ValidationPipeline {
-  validate(document: TextDocument, token: CancellationToken): Promise<void>;
-  dispose(): void;
-}
+${template.prefix}
+${template.suffix}
 
-export function createValidationPipeline(collection: DiagnosticCollection): ValidationPipeline {
-  let revision = 0;
-  return {
-    async validate(document, token) {
-      const currentRevision = ++revision;
-      if (token.isCancellationRequested || document.isClosed) return;
-      if (currentRevision !== revision) return;
-      collection.set(document.uri, []);
-    },
-    dispose() {
-      collection.clear();
-      collection.dispose();
-    }
-  };
-}
+void pipeline;
 `;
 }

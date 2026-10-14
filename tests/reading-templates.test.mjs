@@ -27,8 +27,11 @@ test('all 16 long templates have distinct code, short headers and an exact body 
   assert.equal(render('missing-id').templateId, 'diagnostics');
 });
 
-test('generated TypeScript templates pass strict type checking without executing their code', () => {
-  const files = new Map(core.readingTemplates.map(template => [path.resolve(`tests/template-${template.id}.ts`), render(template.id).content]));
+test('all reading and boss TypeScript templates pass strict type checking without executing their code', () => {
+  const files = new Map(core.readingTemplates.flatMap(template => [
+    [path.resolve(`tests/template-${template.id}.ts`), render(template.id).content],
+    [path.resolve(`tests/boss-template-${template.id}.ts`), core.renderBoss(template.id)]
+  ]));
   const options = { noEmit: true, strict: true, skipLibCheck: true, types: [],
     target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext };
   const host = ts.createCompilerHost(options);
@@ -70,6 +73,18 @@ test('hidden reading markers remove metadata and hints but never change the nove
     assert.match(hidden.content, /原创正文标记/);
     assert.equal(hidden.bodyLine, visible.bodyLine);
   }
+});
+
+test('all 16 boss templates are long pure code without novel content, metadata, progress or navigation hints', () => {
+  const outputs = core.readingTemplates.map(template => core.renderBoss(template.id));
+  assert.equal(new Set(outputs).size, 16);
+  for (const content of outputs) {
+    const lines = content.trimEnd().split('\n').length;
+    assert.ok(lines >= 115 && lines <= 125, `${lines} lines`);
+    assert.doesNotMatch(content, /私有书名|私有章节名|原创正文标记|trace:|navigation:|chapter \d|page \d|Ctrl\+Alt\+B|小说|阅读/);
+    assert.match(content, /stage: 'validation'/);
+  }
+  assert.equal(core.renderBoss('invalid'), core.renderBoss('diagnostics'));
 });
 
 test('chapter mode cycles through all templates without immediate repeats and restores saved choices', () => {

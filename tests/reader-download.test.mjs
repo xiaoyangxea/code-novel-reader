@@ -12,6 +12,7 @@ const built = await esbuild.build({ stdin: { contents: `
   export { ReaderController, ReaderDocumentProvider } from './src/reader';
   export { DownloadManager } from './src/download';
   export { saveBoss } from './src/boss';
+  export { configureBoss } from './src/boss';
   export { ui, window, Uri } from './tests/vscode-mock.mjs';
   export { renderReaderLayout } from './src/renderer';
   export { readingTemplates } from './src/reading-templates';
@@ -21,7 +22,7 @@ const compiled = new Module(path.resolve('tests/test-runtime.cjs'));
 compiled.filename = path.resolve('tests/test-runtime.cjs');
 compiled.paths = Module._nodeModulePaths(process.cwd());
 compiled._compile(built.outputFiles[0].text, compiled.filename);
-const { ReaderController, ReaderDocumentProvider, DownloadManager, saveBoss, ui, window, Uri, renderReaderLayout, readingTemplates } = compiled.exports;
+const { ReaderController, ReaderDocumentProvider, DownloadManager, saveBoss, configureBoss, ui, window, Uri, renderReaderLayout, readingTemplates } = compiled.exports;
 const book = { id: '0123456789abcdef0123', title: '测试书', kind: 'online', source: 'https://example.com/', catalogComplete: true,
   chapters: Array.from({ length: 4 }, (_, i) => ({ title: `第${i + 1}章`, url: `https://example.com/${i}.html` })) };
 
@@ -276,4 +277,85 @@ test('local TXT and EPUB chapters use the same template controls without invokin
     assert.match(provider.provideTextDocumentContent(), /原创本地文本/);
     await reader.dispose();
   }
+});
+
+test('default boss templates rotate independently, stay stable while hidden and preserve reading and prefetch', async () => {
+  ui.configuration = {};
+  ui.reveals = [];
+  const saved = new Map();
+  const ctx = context(saved);
+  const provider = new ReaderDocumentProvider();
+  const requested = [];
+  const progress = { chapterIndex: 0, pageIndex: 1, updatedAt: 0 };
+  const repository = { getProgress: () => ({ ...progress }),
+    saveProgress: async (_, value) => Object.assign(progress, value), saveBook: async () => undefined };
+  const chapters = { allowBook() {}, get: async (_, index) => {
+    requested.push(index);
+    return { ...book.chapters[index], content: '不得泄漏的测试正文。'.repeat(600) };
+  } };
+  ui.editorDocument = { getText: () => provider.provideTextDocumentContent(),
+    get lineCount() { return provider.provideTextDocumentContent().split('\n').length; } };
+  const reader = new ReaderController(repository, provider, {}, ctx, chapters);
+  try {
+    await reader.openBook(book);
+    const original = provider.provideTextDocumentContent();
+    const variants = [];
+    let previous = '';
+    for (let index = 0; index < 16; index++) {
+      reader.toggleBoss();
+      const code = provider.provideTextDocumentContent();
+      assert.notEqual(code, previous);
+      assert.doesNotMatch(code, /不得泄漏|测试书|第1章|trace:|navigation:/);
+      variants.push(code);
+      const reveals = ui.reveals.length;
+      reader.refreshReadingTemplate();
+      assert.equal(provider.provideTextDocumentContent(), code, 'settings refresh does not reshuffle hidden code');
+      await until(() => ui.reveals.length > reveals);
+      assert.equal(ui.reveals.at(-1).start.line, 0, 'boss mode reveals the code header');
+      reader.toggleBoss();
+      assert.equal(provider.provideTextDocumentContent(), original);
+      previous = code;
+    }
+    assert.equal(new Set(variants).size, 16);
+    reader.toggleBoss();
+    assert.notEqual(provider.provideTextDocumentContent(), previous, 'cycle boundary does not immediately repeat');
+    await until(() => requested.length === 4);
+    assert.deepEqual(requested, [0, 1, 2, 3]);
+    assert.equal(progress.pageIndex, 1);
+    assert.equal(progress.chapterIndex, 0);
+    await reader.dispose();
+    const hidden = provider.provideTextDocumentContent();
+    const restored = new ReaderController(repository, new ReaderDocumentProvider(), {}, ctx, chapters);
+    assert.equal(restored.getBossContent(), hidden, 'default preview restores the latest boss template');
+    assert.deepEqual(saved.get('codeNovel.bossTemplates.v1').books, [], 'boss state contains no book or chapter data');
+    await restored.dispose();
+  } finally { await reader.dispose(); ui.editorDocument = undefined; }
+});
+
+test('custom boss snapshots including empty text win over random templates, and reset uses a long default template', async () => {
+  ui.configuration = { prefetchNextChapter: false };
+  const saved = new Map([['codeNovel.bossContent', '']]);
+  const ctx = context(saved);
+  const provider = new ReaderDocumentProvider();
+  const reader = new ReaderController({ getProgress: () => ({ chapterIndex: 0, pageIndex: 0, updatedAt: 0 }),
+    saveProgress: async () => undefined, saveBook: async () => undefined }, provider, {}, ctx,
+    { allowBook() {}, get: async () => ({ ...book.chapters[0], content: '不得泄漏的测试正文。' }) });
+  await reader.openBook(book);
+  reader.toggleBoss();
+  assert.equal(provider.provideTextDocumentContent(), '');
+  assert.equal(saved.has('codeNovel.bossTemplates.v1'), false);
+  await ctx.globalState.update('codeNovel.bossContent', 'const custom = 17;');
+  reader.refreshBossContent();
+  assert.equal(provider.provideTextDocumentContent(), 'const custom = 17;');
+  reader.toggleBoss(); reader.toggleBoss();
+  assert.equal(provider.provideTextDocumentContent(), 'const custom = 17;');
+  assert.equal(saved.has('codeNovel.bossTemplates.v1'), false);
+  ui.choices = [{ value: 'reset' }];
+  await configureBoss(ctx, reader);
+  const code = provider.provideTextDocumentContent();
+  assert.ok(code.trimEnd().split('\n').length >= 115);
+  assert.doesNotMatch(code, /不得泄漏|测试书|const custom/);
+  assert.equal(reader.getBossContent(), code);
+  await reader.dispose();
+  assert.ok(saved.get('codeNovel.bossTemplates.v1'));
 });

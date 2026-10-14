@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import { renderBoss } from './renderer';
 import { ReaderController } from './reader';
 
 export function validateBossContent(content: string): string {
@@ -15,7 +14,7 @@ export async function configureBoss(context: vscode.ExtensionContext, reader: Re
     { label: '恢复默认 TypeScript 模板', value: 'reset' }
   ], { title: '老板键显示内容', placeHolder: '仅显示文本，不执行代码；快捷键可在 VS Code 键盘快捷方式中修改' });
   if (!action) return;
-  const content = context.globalState.get<string>('codeNovel.bossContent') ?? renderBoss();
+  const content = reader.getBossContent();
   if (action.value === 'reset') {
     await context.globalState.update('codeNovel.bossContent', undefined);
     reader.refreshBossContent();

@@ -149,7 +149,7 @@ test('rejects EPUB entries with a compression-bomb ratio before extraction', asy
 
 test('boss view contains no reading text', () => {
   const hidden = renderBoss();
-  assert.match(hidden, /ValidationPipeline/);
+  assert.match(hidden, /DiagnosticRegistry/);
   assert.doesNotMatch(hidden, /小说|章节|阅读/);
 });
 
