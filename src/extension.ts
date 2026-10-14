@@ -312,6 +312,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand('codeNovel.configureBoss', () => configureBoss(context, reader).catch(handleError)),
     vscode.commands.registerCommand('codeNovel.saveBossContent', () => saveBoss(context, reader).catch(handleError)),
+    vscode.commands.registerCommand('codeNovel.switchReadingTemplate', () => reader.switchReadingTemplate().catch(handleError)),
     vscode.commands.registerCommand('codeNovel.importUrl', () => importOnlineUrl(context, repository, sources, reader).catch(handleError)),
     vscode.commands.registerCommand('codeNovel.openLocal', () => importLocal(repository, reader).catch(handleError)),
     vscode.commands.registerCommand('codeNovel.openBook', (item?: BookItem | Book) => {
@@ -358,6 +359,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('codeNovel.toggleBoss', () => reader.toggleBoss()),
     vscode.commands.registerCommand('codeNovel.reloadChapter', () => reader.reloadChapter().catch(handleError))
   );
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+    if (['readingTemplateMode', 'readingTemplate', 'hideReadingMarkers', 'commentWidth']
+      .some((setting) => event.affectsConfiguration(`codeNovel.${setting}`))) reader.refreshReadingTemplate();
+  }));
 }
 
 export async function deactivate(): Promise<void> {

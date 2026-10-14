@@ -15,7 +15,9 @@ export {
 export { normalizeSavedCatalog } from './adapters';
 export { parseEpub, parsePlainText, validateEpubArchive } from './local';
 export { assertSafeRemoteUrl, resolveSafeRemoteUrl, fetchHtml, isBlockedNetworkAddress, readBodyLimited } from './net';
-export { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
+export { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReader, renderReaderLayout } from './renderer';
+export { readingTemplates, readingTemplate } from './reading-templates';
+export { ReadingTemplateSelector, readingTemplateMode, templateStateKey } from './template-selection';
 export { normalizeNovelSource, parseSourceSearchHtml } from './source-rules';
 export { BrowserAutomationBlockedError, browserIsolationArguments, findBrowserExecutable, isBrowserChallengeHtml, renderHtmlBatchWithBrowser, renderHtmlWithBrowser, startVerificationBrowser } from './browser';
 export { readChromiumCachedHtml, readChromiumCachedHtmlBatch } from './chromium-cache';

@@ -4,8 +4,10 @@ import { ChapterService } from './chapter-service';
 import { maxLocalBookBytes, parseEpub, ParsedLocalBook, parsePlainText } from './local';
 import { Book, ChapterContent, ReadingProgress } from './model';
 import { BookRepository, SourceRepository } from './repository';
-import { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReader } from './renderer';
+import { chapterPrefetchIndexes, pageNavigationState, paginate, renderBoss, renderReaderLayout } from './renderer';
 import { normalizeSavedCatalog } from './adapters';
+import { readingTemplate, readingTemplates } from './reading-templates';
+import { ReadingTemplateSelector, readingTemplateMode, templateStateKey } from './template-selection';
 
 export class ReaderDocumentProvider implements vscode.TextDocumentContentProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
@@ -39,6 +41,9 @@ export class ReaderController {
   private navigationContext?: { hasPreviousPage: boolean; hasNextPage: boolean; bossMode: boolean };
   private revealRevision = 0;
   private chapterRevision = 0;
+  private readonly templates: ReadingTemplateSelector;
+  private templateWrite: Promise<void> = Promise.resolve();
+  private savedTemplateRevision = 0;
 
   constructor(
     private readonly repository: BookRepository,
@@ -47,7 +52,9 @@ export class ReaderController {
     private readonly context: vscode.ExtensionContext,
     private readonly chapters: ChapterService,
     private readonly onError?: (error: unknown) => void | Promise<void>
-  ) {}
+  ) {
+    this.templates = new ReadingTemplateSelector(context.globalState.get(templateStateKey));
+  }
 
   private rememberLocalBook(bookId: string, parsed: ParsedLocalBook): void {
     this.localCache.delete(bookId);
@@ -69,6 +76,9 @@ export class ReaderController {
     return {
       pageCharacters: config.get<number>('pageCharacters', 1400),
       commentWidth: config.get<number>('commentWidth', 72),
+      readingTemplateMode: readingTemplateMode(config.get<string>('readingTemplateMode', 'chapter')),
+      readingTemplate: readingTemplate(config.get<string>('readingTemplate', 'diagnostics')).id,
+      hideReadingMarkers: config.get<boolean>('hideReadingMarkers', false),
       timeoutMs: config.get<number>('requestTimeout', 15000),
       userAgent: config.get<string>('userAgent', 'Mozilla/5.0'),
       proxy: config.get<string>('proxy') || vscode.workspace.getConfiguration('http').get<string>('proxy') || undefined,
@@ -242,17 +252,66 @@ export class ReaderController {
       this.provider.update(this.bossContent());
       return;
     }
-    const content = renderReader(
+    const config = this.config();
+    const templateId = this.templates.choose(this.activeBook.id, this.chapter.url,
+      config.readingTemplateMode, config.readingTemplate);
+    this.persistTemplates();
+    const layout = renderReaderLayout(
       this.activeBook,
       this.chapter,
       this.pages[this.progress.pageIndex] ?? '',
       this.progress.chapterIndex,
       this.progress.pageIndex,
       this.pages.length,
-      this.config().commentWidth
+      config.commentWidth,
+      { templateId, hideReadingMarkers: config.hideReadingMarkers }
     );
-    this.provider.update(content);
-    void this.revealReadingArea(content);
+    this.provider.update(layout.content);
+    void this.revealReadingArea(layout.content, layout.bodyLine);
+  }
+
+  private persistTemplates(): void {
+    if (this.savedTemplateRevision === this.templates.revision) return;
+    this.savedTemplateRevision = this.templates.revision;
+    const revision = this.savedTemplateRevision;
+    const snapshot = this.templates.snapshot();
+    this.templateWrite = this.templateWrite.catch(() => undefined)
+      .then(() => this.context.globalState.update(templateStateKey, snapshot));
+    void this.templateWrite.catch((error) => {
+      if (this.savedTemplateRevision === revision) this.savedTemplateRevision = -1;
+      this.reportBackgroundError(error);
+    });
+  }
+
+  refreshReadingTemplate(): void { if (this.activeBook && this.chapter) this.render(); }
+
+  async switchReadingTemplate(): Promise<void> {
+    const book = this.activeBook;
+    const chapter = this.chapter;
+    if (!book || !chapter) {
+      vscode.window.showInformationMessage('请先打开一本书。');
+      return;
+    }
+    const config = this.config();
+    const current = this.templates.choose(book.id, chapter.url, config.readingTemplateMode, config.readingTemplate);
+    const picked = await vscode.window.showQuickPick([
+      { label: '$(shuffle) 随机换一套', id: '' },
+      ...readingTemplates.map((item) => ({ label: item.label, description: item.id === current ? '当前模板' : '', id: item.id }))
+    ], { title: '切换阅读模板', placeHolder: '只改变代码外壳，正文、分页和后台任务不变' });
+    if (!picked || this.activeBook !== book || this.chapter !== chapter) return;
+    const latest = this.config();
+    const selected = this.templates.change(book.id, chapter.url, latest.readingTemplateMode, picked.id || undefined,
+      this.templates.choose(book.id, chapter.url, latest.readingTemplateMode, latest.readingTemplate));
+    if (latest.readingTemplateMode === 'fixed') {
+      const settings = vscode.workspace.getConfiguration('codeNovel');
+      const values = settings.inspect<string>('readingTemplate');
+      const target = values?.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder
+        : values?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+      await settings.update('readingTemplate', selected, target);
+    }
+    this.persistTemplates();
+    if (this.activeBook === book && this.chapter === chapter) this.render();
+    await this.templateWrite;
   }
 
   private updateNavigationContext(): void {
@@ -272,22 +331,13 @@ export class ReaderController {
     this.navigationContext = next;
   }
 
-  private async revealReadingArea(expectedContent: string): Promise<void> {
+  private async revealReadingArea(expectedContent: string, bodyLine: number): Promise<void> {
     const revision = ++this.revealRevision;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20));
       if (revision !== this.revealRevision || !this.editor || this.bossMode) return;
       if (this.editor.document.getText() !== expectedContent) continue;
-      let bodyLine = -1;
-      for (let line = 12; line < this.editor.document.lineCount; line += 1) {
-        const text = this.editor.document.lineAt(line).text;
-        if (text.startsWith('// trace:')) break;
-        if (/^\s*\/\/ /.test(text)) {
-          bodyLine = line;
-          break;
-        }
-      }
-      const line = bodyLine >= 0 ? bodyLine : Math.min(16, Math.max(this.editor.document.lineCount - 1, 0));
+      const line = Math.min(bodyLine, Math.max(this.editor.document.lineCount - 1, 0));
       const position = new vscode.Position(line, 0);
       this.editor.selection = new vscode.Selection(position, position);
       this.editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.AtTop);
@@ -338,6 +388,7 @@ export class ReaderController {
     this.prefetchTimer = undefined;
     this.prefetchRevision += 1;
     await this.flushProgress();
+    await this.templateWrite;
   }
 
   async nextPage(): Promise<void> {
@@ -449,6 +500,8 @@ export class ReaderController {
   refreshBossContent(): void { if (this.bossMode || !this.activeBook) this.render(); }
 
   forgetBook(id: string): void {
+    this.templates.forget(id);
+    this.persistTemplates();
     if (this.activeBook?.id !== id) return;
     if (this.prefetchTimer) clearTimeout(this.prefetchTimer);
     this.prefetchRevision += 1;

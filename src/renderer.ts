@@ -1,4 +1,5 @@
 import { Book, ChapterContent } from './model';
+import { readingTemplate } from './reading-templates';
 
 export function pageNavigationState(pageIndex: number, pageCount: number): {
   hasPreviousPage: boolean;
@@ -53,7 +54,7 @@ export function paginate(content: string, targetCharacters: number): string[] {
 
 function splitDisplayLines(text: string, width: number): string[] {
   const lines: string[] = [];
-  for (const paragraph of text.split('\n')) {
+  for (const paragraph of text.split(/\r\n?|\n|\u2028|\u2029/)) {
     if (!paragraph) {
       lines.push('');
       continue;
@@ -79,6 +80,7 @@ function splitDisplayLines(text: string, width: number): string[] {
 
 function safeComment(line: string): string {
   return line
+    .replace(/[\r\n\u2028\u2029]/g, ' ')
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
     .replace(/[\u202a-\u202e\u2066-\u2069]/gi, '')
     .replace(/\*\//g, '* /');
@@ -98,38 +100,37 @@ export function renderReader(
   chapterIndex: number,
   pageIndex: number,
   pageCount: number,
-  commentWidth: number
+  commentWidth: number,
+  options: { templateId?: string; hideReadingMarkers?: boolean } = {}
 ): string {
-  const lines = splitDisplayLines(pageText, commentWidth);
-  const comments = lines.map((line) => `  // ${safeComment(line)}`).join('\n');
-  return `/* eslint-disable @typescript-eslint/no-unused-vars */
-import type { Diagnostic, Range } from 'vscode';
-
-interface ParseContext {
-  readonly source: string;
-  readonly revision: number;
-  readonly diagnostics: Diagnostic[];
+  return renderReaderLayout(book, chapter, pageText, chapterIndex, pageIndex, pageCount, commentWidth, options).content;
 }
 
+export function renderReaderLayout(
+  book: Book, chapter: ChapterContent, pageText: string, chapterIndex: number,
+  pageIndex: number, pageCount: number, commentWidth: number,
+  options: { templateId?: string; hideReadingMarkers?: boolean } = {}
+): { content: string; bodyLine: number; templateId: string } {
+  const template = readingTemplate(options.templateId);
+  const lines = splitDisplayLines(pageText, commentWidth);
+  const comments = lines.map((line) => `  // ${safeComment(line)}`).join('\n');
+  const prefix = `/* eslint-disable @typescript-eslint/no-unused-vars */
 const pipeline = {
-  name: ${safeCodeString(book.title)},
-  stage: ${safeCodeString(chapter.title)},
+  name: ${safeCodeString(options.hideReadingMarkers ? template.id : book.title)},
+  stage: ${safeCodeString(options.hideReadingMarkers ? 'processing' : chapter.title)},
   revision: ${chapterIndex + 1},
   offset: ${pageIndex + 1}
 } as const;
 
-export function collectDiagnostics(context: ParseContext): Diagnostic[] {
-  const diagnostics = [...context.diagnostics];
+${template.prefix}
 
-${comments}
-
-  return diagnostics;
-}
-
-// trace: chapter ${chapterIndex + 1}/${book.chapters.length} · page ${pageIndex + 1}/${pageCount}
-// navigation: Alt+Left/Right 翻页 · Alt+Shift+Left/Right 翻章 · Ctrl+Alt+B 隐藏
-void pipeline;
 `;
+  const footer = options.hideReadingMarkers ? '\nvoid pipeline;\n'
+    : `\n// trace: chapter ${chapterIndex + 1}/${book.chapters.length} · page ${pageIndex + 1}/${pageCount}
+// navigation: Alt+Left/Right 翻页 · Alt+Shift+Left/Right 翻章 · Ctrl+Alt+B 隐藏
+void pipeline;\n`;
+  return { content: prefix + comments + template.suffix + footer,
+    bodyLine: prefix.split('\n').length - 1, templateId: template.id };
 }
 
 export function renderBoss(): string {

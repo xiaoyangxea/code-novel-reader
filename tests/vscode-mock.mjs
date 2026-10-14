@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-export const ui = { choices: [], inputs: [], messages: [], configuration: {}, saveTarget: undefined };
+export const ui = { choices: [], inputs: [], messages: [], configuration: {}, saveTarget: undefined, editorDocument: undefined, reveals: [] };
+export const ConfigurationTarget = { Global: 1, Workspace: 2, WorkspaceFolder: 3 };
 export class EventEmitter { event = () => ({ dispose() {} }); fire() {} dispose() {} }
 export class Uri {
   constructor(fsPath, scheme = 'file') { this.fsPath = fsPath; this.scheme = scheme; }
@@ -18,7 +19,8 @@ export class Selection extends Range {}
 export const commands = { executeCommand: async () => undefined };
 export const languages = { setTextDocumentLanguage: async () => undefined };
 export const workspace = {
-  getConfiguration: () => ({ get: (key, fallback) => ui.configuration[key] ?? fallback, inspect: () => ({}) }),
+  getConfiguration: () => ({ get: (key, fallback) => ui.configuration[key] ?? fallback, inspect: () => ({}),
+    update: async (key, value) => { ui.configuration[key] = value; } }),
   openTextDocument: async (value) => ({ uri: value instanceof Uri ? value : Uri.parse('untitled:boss.ts'),
     getText: () => value.content ?? '', lineCount: 1, lineAt: () => ({ text: '' }) }),
   fs: {
@@ -35,7 +37,8 @@ export const window = {
   showInputBox: async () => ui.inputs.shift(),
   showOpenDialog: async () => ui.choices.shift(),
   showSaveDialog: async () => ui.saveTarget,
-  showTextDocument: async (document) => ({ document, revealRange() {} }),
+  showTextDocument: async (document) => ({ document: ui.editorDocument ?? document,
+    revealRange(range) { ui.reveals.push(range); } }),
   withProgress: async (_, task) => task({ report() {} }),
   showInformationMessage: async (message) => { ui.messages.push(message); },
   showWarningMessage: async (message) => { ui.messages.push(message); return ui.choices.shift(); },

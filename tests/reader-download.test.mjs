@@ -13,13 +13,15 @@ const built = await esbuild.build({ stdin: { contents: `
   export { DownloadManager } from './src/download';
   export { saveBoss } from './src/boss';
   export { ui, window, Uri } from './tests/vscode-mock.mjs';
+  export { renderReaderLayout } from './src/renderer';
+  export { readingTemplates } from './src/reading-templates';
 `, resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', write: false,
   plugins: [{ name: 'vscode-test-double', setup(build) { build.onResolve({ filter: /^vscode$/ }, () => ({ path: path.resolve('tests/vscode-mock.mjs') })); } }] });
 const compiled = new Module(path.resolve('tests/test-runtime.cjs'));
 compiled.filename = path.resolve('tests/test-runtime.cjs');
 compiled.paths = Module._nodeModulePaths(process.cwd());
 compiled._compile(built.outputFiles[0].text, compiled.filename);
-const { ReaderController, ReaderDocumentProvider, DownloadManager, saveBoss, ui, window, Uri } = compiled.exports;
+const { ReaderController, ReaderDocumentProvider, DownloadManager, saveBoss, ui, window, Uri, renderReaderLayout, readingTemplates } = compiled.exports;
 const book = { id: '0123456789abcdef0123', title: '测试书', kind: 'online', source: 'https://example.com/', catalogComplete: true,
   chapters: Array.from({ length: 4 }, (_, i) => ({ title: `第${i + 1}章`, url: `https://example.com/${i}.html` })) };
 
@@ -149,4 +151,129 @@ test('download restart leaves unfinished work paused until explicitly resumed', 
   const manager = new DownloadManager(context(new Map([['codeNovel.downloads.v1', { [book.id]: state }]])), {}, {}, async () => undefined);
   assert.equal(manager.states[book.id].status, 'paused');
   manager.dispose();
+});
+
+test('reader template switching preserves paging, cache calls, progress and boss mode and restores after restart', async () => {
+  ui.configuration = { prefetchNextChapter: false };
+  ui.editorDocument = undefined;
+  const saved = new Map();
+  const ctx = context(saved);
+  let progress = { chapterIndex: 0, pageIndex: 0, updatedAt: 0 };
+  let requests = 0;
+  const repository = { getProgress: () => ({ ...progress }),
+    saveProgress: async (_, value) => { progress = { ...value }; }, saveBook: async () => undefined,
+    deleteCachedChapter: async () => undefined };
+  const chapters = { allowBook() {}, get: async (_, index) => {
+    requests++;
+    return { title: book.chapters[index].title, url: book.chapters[index].url, content: '原创测试正文。'.repeat(900) };
+  } };
+  const provider = new ReaderDocumentProvider();
+  const reader = new ReaderController(repository, provider, {}, ctx, chapters);
+  await reader.openBook(book);
+  await reader.nextPage();
+  ui.choices = [{ id: 'events' }];
+  await reader.switchReadingTemplate();
+  const expected = provider.provideTextDocumentContent();
+  assert.match(expected, /export class EventBus/);
+  assert.match(expected, /page 2\//);
+  assert.equal(requests, 1);
+  await reader.reloadChapter();
+  assert.equal(provider.provideTextDocumentContent(), expected, 'refresh keeps the same chapter template');
+  assert.equal(requests, 2);
+  await reader.nextPage();
+  assert.match(provider.provideTextDocumentContent(), /export class EventBus/);
+  reader.toggleBoss();
+  const hidden = provider.provideTextDocumentContent();
+  ui.choices = [{ id: 'cache' }];
+  await reader.switchReadingTemplate();
+  assert.equal(provider.provideTextDocumentContent(), hidden);
+  reader.toggleBoss();
+  assert.match(provider.provideTextDocumentContent(), /export class MemoryCache/);
+  await reader.dispose();
+  const restoredProvider = new ReaderDocumentProvider();
+  const restored = new ReaderController(repository, restoredProvider, {}, ctx, chapters);
+  await restored.openBook(book);
+  assert.match(restoredProvider.provideTextDocumentContent(), /export class MemoryCache/);
+  assert.match(restoredProvider.provideTextDocumentContent(), /page 3\//);
+  await restored.nextChapter();
+  assert.doesNotMatch(restoredProvider.provideTextDocumentContent(), /export class MemoryCache/);
+  await restored.previousChapter();
+  assert.match(restoredProvider.provideTextDocumentContent(), /export class MemoryCache/);
+  restored.forgetBook(book.id);
+  await restored.dispose();
+  assert.equal(saved.get('codeNovel.readingTemplates.v1').books.length, 0);
+});
+
+test('fixed mode command changes the setting, hidden markers take effect, and cancelling selection is inert', async () => {
+  ui.configuration = { prefetchNextChapter: false, readingTemplateMode: 'fixed', readingTemplate: 'metrics', hideReadingMarkers: true };
+  const provider = new ReaderDocumentProvider();
+  const reader = new ReaderController({ getProgress: () => ({ chapterIndex: 0, pageIndex: 0, updatedAt: 0 }),
+    saveProgress: async () => undefined, saveBook: async () => undefined }, provider, {}, context(),
+    { allowBook() {}, get: async (_, index) => ({ ...book.chapters[index], content: '原创测试正文。'.repeat(100) }) });
+  await reader.openBook(book);
+  assert.match(provider.provideTextDocumentContent(), /export class PerformanceTracker/);
+  assert.doesNotMatch(provider.provideTextDocumentContent(), /测试书|第1章|navigation:/);
+  ui.choices = [{ id: 'plugins' }];
+  await reader.switchReadingTemplate();
+  assert.equal(ui.configuration.readingTemplate, 'plugins');
+  await reader.nextChapter();
+  assert.match(provider.provideTextDocumentContent(), /export class PluginHost/);
+  const expected = provider.provideTextDocumentContent();
+  ui.choices = [undefined];
+  await reader.switchReadingTemplate();
+  assert.equal(provider.provideTextDocumentContent(), expected);
+  ui.choices = [{ id: '' }];
+  await reader.switchReadingTemplate();
+  assert.notEqual(ui.configuration.readingTemplate, 'plugins');
+  await reader.dispose();
+});
+
+test('every template reveals the exact first novel line after opening and paging, not a code comment', async () => {
+  ui.configuration = { prefetchNextChapter: false, readingTemplateMode: 'fixed' };
+  ui.reveals = [];
+  const provider = new ReaderDocumentProvider();
+  const chapter = { ...book.chapters[0], content: '原创定位正文。'.repeat(900) };
+  ui.editorDocument = { getText: () => provider.provideTextDocumentContent(),
+    get lineCount() { return provider.provideTextDocumentContent().split('\n').length; } };
+  const reader = new ReaderController({ getProgress: () => ({ chapterIndex: 0, pageIndex: 0, updatedAt: 0 }),
+    saveProgress: async () => undefined, saveBook: async () => undefined }, provider, {}, context(),
+    { allowBook() {}, get: async () => chapter });
+  try {
+    await reader.openBook(book);
+    for (const template of readingTemplates) {
+      ui.configuration.readingTemplate = template.id;
+      const previous = ui.reveals.length;
+      reader.refreshReadingTemplate();
+      await until(() => ui.reveals.length > previous);
+      const line = ui.reveals.at(-1).start.line;
+      assert.match(provider.provideTextDocumentContent().split('\n')[line], /\/\/ 原创定位正文/);
+      const layout = renderReaderLayout(book, chapter, '', 0, 0, 1, 72, { templateId: template.id });
+      assert.equal(line, layout.bodyLine);
+    }
+    const previous = ui.reveals.length;
+    await reader.nextPage();
+    await until(() => ui.reveals.length > previous);
+    assert.match(provider.provideTextDocumentContent().split('\n')[ui.reveals.at(-1).start.line], /^  \/\/ /);
+  } finally { await reader.dispose(); ui.editorDocument = undefined; }
+});
+
+test('local TXT and EPUB chapters use the same template controls without invoking online loading', async () => {
+  for (const kind of ['txt', 'epub']) {
+    ui.configuration = { prefetchNextChapter: false, readingTemplateMode: 'book' };
+    const localBook = { ...book, id: `local-${kind}`, title: '本地测试书', kind,
+      source: `C:/test.${kind}`, chapters: [{ title: '第一章', url: `C:/test.${kind}#0` }] };
+    const parsed = { title: localBook.title, chapters: localBook.chapters,
+      contents: [{ ...localBook.chapters[0], content: '原创本地文本。'.repeat(500) }] };
+    const provider = new ReaderDocumentProvider();
+    const reader = new ReaderController({ getProgress: () => ({ chapterIndex: 0, pageIndex: 0, updatedAt: 0 }),
+      saveProgress: async () => undefined, saveBook: async () => undefined }, provider, {}, context(),
+      { allowBook() {}, get: async () => assert.fail('local reading must not load online chapters') });
+    await reader.openBook(localBook, parsed);
+    ui.choices = [{ id: 'batch' }];
+    await reader.switchReadingTemplate();
+    await reader.nextPage();
+    assert.match(provider.provideTextDocumentContent(), /export class BatchQueue/);
+    assert.match(provider.provideTextDocumentContent(), /原创本地文本/);
+    await reader.dispose();
+  }
 });

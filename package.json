@@ -2,7 +2,7 @@
   "name": "code-novel-reader",
   "displayName": "Code Novel Reader - 代码小说阅读器",
   "description": "在 VS Code 原生 TypeScript 编辑器中以代码注释阅读在线或本地小说，支持目录、翻页、进度和老板键。",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "publisher": "xiaoyangxea",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -42,6 +42,10 @@
   ],
   "contributes": {
     "commands": [
+      {
+        "command": "codeNovel.switchReadingTemplate",
+        "title": "代码小说: 切换阅读模板"
+      },
       {
         "command": "codeNovel.downloadBook",
         "title": "代码小说: 下载到本地 / 导出 TXT",
@@ -272,6 +276,25 @@
     "configuration": {
       "title": "Code Novel Reader",
       "properties": {
+        "codeNovel.readingTemplateMode": {
+          "type": "string",
+          "enum": ["chapter", "book", "fixed"],
+          "enumDescriptions": ["按章随机轮换，同章翻页保持不变。", "每本书随机选择一套，翻章保持不变。", "始终使用指定模板。"],
+          "default": "chapter",
+          "description": "阅读代码模板的切换方式。"
+        },
+        "codeNovel.readingTemplate": {
+          "type": "string",
+          "enum": ["diagnostics", "requests", "cache", "scheduler", "configuration", "transform", "events", "state", "logging", "retry", "plugins", "dependencies", "files", "search", "metrics", "batch"],
+          "enumDescriptions": ["诊断分析", "请求处理", "缓存管理", "任务调度", "配置校验", "数据转换", "事件总线", "状态管理", "日志采集", "重试策略", "插件注册", "依赖注入", "文件索引", "搜索管线", "性能统计", "批处理队列"],
+          "default": "diagnostics",
+          "description": "固定模式使用的 TypeScript 模板；也可通过“切换阅读模板”命令指定。"
+        },
+        "codeNovel.hideReadingMarkers": {
+          "type": "boolean",
+          "default": false,
+          "description": "在阅读代码中用普通字段值替代书名和章节名，并隐藏页码及阅读快捷键提示；不会修改正文或书架。"
+        },
         "codeNovel.pageCharacters": {
           "type": "number",
           "default": 1400,
